@@ -1,37 +1,41 @@
-"use client";
-
 import { FormEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { joinRoom, selfId } from "trystero";
 import {
+  CHAT_TEXT_LIMIT,
+  loadOwnChatHistory,
+  mergeChatEntries,
+  OWN_CHAT_HISTORY_LIMIT,
+  sanitizeChatPayload,
+  saveOwnChatHistory,
+  type ChatEntry,
+  type ChatHistoryRequest,
+  type ChatHistoryResponse,
+  type ChatPayload,
+} from "./chat.ts";
+import {
   GAME_DEFINITIONS as GAMES,
   GAME_HEIGHT as HEIGHT,
   GAME_WIDTH as WIDTH,
+  isPlaceId,
+  PLAYER_NAME_LIMIT,
   type GameDefinition,
   type GameId,
+  type PlaceId,
   type PlayerState,
   type PulseState,
-} from "./games";
-import { applyLobbyImpulse, isLobbyImpulsePlausible, resolveLobbyCollisions, steerLobbyPlayer } from "./lobbyPhysics";
+} from "./games.ts";
+import { applyLobbyImpulse, isLobbyImpulsePlausible, resolveLobbyCollisions, steerLobbyPlayer } from "./lobbyPhysics.ts";
+import { receiveRemotePlayer, smoothRemotePlayers, type RemoteMotion, type WirePlayer } from "./remotePlayers.ts";
 
-type PlaceId = "lobby" | GameId;
 type Player = PlayerState;
-type WirePlayer = Omit<Player, "seen"> & { seen?: number };
-type RemoteMotion = { x: number; y: number; vx: number; vy: number; receivedAt: number };
 type Pulse = PulseState;
 type PresencePayload = { name: string; place: PlaceId; at: number };
-type ChatPayload = { id: string; name: string; text: string; at: number; place: PlaceId };
-type ChatEntry = ChatPayload & { authorId: string; system?: boolean };
-type ChatHistoryRequest = { version: 1 };
-type ChatHistoryResponse = { messages: ChatPayload[] };
 type LobbyImpulsePayload = { id: string; targetId: string; vx: number; vy: number; at: number };
 
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
-const OWN_CHAT_STORAGE_KEY = "multiplay-own-chat-v1";
-const OWN_CHAT_HISTORY_LIMIT = 40;
-const CHAT_LOG_LIMIT = 100;
 const LOBBY = {
   id: "lobby" as const,
   icon: "⌂",
@@ -46,106 +50,21 @@ const LOBBY = {
 const PLACES = [LOBBY, ...GAMES];
 const LOBBY_PORTALS = GAMES.map((game) => ({ gameId: game.id, ...game.portal }));
 
-function isPlaceId(value: unknown): value is PlaceId {
-  return value === "lobby" || GAMES.some((game) => game.id === value);
-}
-
 function shortId(id: string) {
   return id.slice(0, 5).toUpperCase();
 }
 
-function sanitizeChatPayload(value: unknown): ChatPayload | null {
-  if (!value || typeof value !== "object") return null;
-  const item = value as Partial<ChatPayload>;
-  if (typeof item.id !== "string" || typeof item.name !== "string" || typeof item.text !== "string") return null;
-  if (typeof item.at !== "number" || !Number.isFinite(item.at) || !isPlaceId(item.place)) return null;
-  const text = item.text.trim().slice(0, 180);
-  if (!text) return null;
-  return {
-    id: item.id.slice(0, 120),
-    name: item.name.slice(0, 14),
-    text,
-    at: item.at,
-    place: item.place,
-  };
-}
+let sharedAudioContext: AudioContext | null = null;
 
-function loadOwnChatHistory() {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(OWN_CHAT_STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(stored)) return [];
-    return stored.map(sanitizeChatPayload).filter((item): item is ChatPayload => item !== null).slice(-OWN_CHAT_HISTORY_LIMIT);
-  } catch {
-    return [];
+// Browsers cap concurrent AudioContexts, so every tone reuses a single lazily created one.
+function getAudioContext() {
+  if (!sharedAudioContext) {
+    const AudioCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtor) return null;
+    sharedAudioContext = new AudioCtor();
   }
-}
-
-function saveOwnChatHistory(history: ChatPayload[]) {
-  try {
-    window.localStorage.setItem(OWN_CHAT_STORAGE_KEY, JSON.stringify(history.slice(-OWN_CHAT_HISTORY_LIMIT)));
-  } catch {
-    // Storage can be unavailable in private modes; live chat should continue working.
-  }
-}
-
-function mergeChatEntries(current: ChatEntry[], incoming: ChatEntry[]) {
-  const system = current.find((entry) => entry.system);
-  const byMessageId = new Map<string, ChatEntry>();
-  for (const entry of [...current, ...incoming]) {
-    if (!entry.system) byMessageId.set(entry.id, entry);
-  }
-  const messages = [...byMessageId.values()]
-    .sort((first, second) => first.at - second.at)
-    .slice(-(CHAT_LOG_LIMIT - (system ? 1 : 0)));
-  return system ? [system, ...messages] : messages;
-}
-
-
-function receiveRemotePlayer(
-  players: Map<string, Player>,
-  motions: Map<string, RemoteMotion>,
-  state: WirePlayer,
-  peerId: string,
-) {
-  if (!state || typeof state.x !== "number" || typeof state.y !== "number") return;
-  const receivedAt = Date.now();
-  const vx = typeof state.vx === "number" ? state.vx : 0;
-  const vy = typeof state.vy === "number" ? state.vy : 0;
-  const existing = players.get(peerId);
-  if (existing) {
-    existing.name = state.name;
-    existing.color = state.color;
-    existing.score = state.score;
-    existing.crown = state.crown;
-    existing.seen = receivedAt;
-  } else {
-    players.set(peerId, { ...state, id: peerId, vx, vy, seen: receivedAt });
-  }
-  motions.set(peerId, { x: state.x, y: state.y, vx, vy, receivedAt });
-}
-
-function smoothRemotePlayers(
-  players: Map<string, Player>,
-  motions: Map<string, RemoteMotion>,
-  dt: number,
-  now: number,
-) {
-  const blend = 1 - Math.exp(-11 * dt);
-  for (const [id, motion] of motions) {
-    const player = players.get(id);
-    if (!player || id === selfId) continue;
-    const prediction = Math.min((now - motion.receivedAt) / 1000, .22);
-    const targetX = motion.x + motion.vx * prediction;
-    const targetY = motion.y + motion.vy * prediction;
-    if (Math.hypot(targetX - player.x, targetY - player.y) > 220) {
-      player.x = targetX; player.y = targetY;
-    } else {
-      player.x += (targetX - player.x) * blend;
-      player.y += (targetY - player.y) * blend;
-    }
-    player.vx += (motion.vx - player.vx) * blend;
-    player.vy += (motion.vy - player.vy) * blend;
-  }
+  if (sharedAudioContext.state === "suspended") void sharedAudioContext.resume();
+  return sharedAudioContext;
 }
 
 function useReconnectEpoch() {
@@ -230,29 +149,24 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     presenceAction.onMessage = (payload, { peerId }) => {
       if (!payload || typeof payload.name !== "string" || !isPlaceId(payload.place)) return;
       setPresence((current) => new Map(current).set(peerId, {
-        name: payload.name.slice(0, 14),
+        name: payload.name.slice(0, PLAYER_NAME_LIMIT),
         place: payload.place,
         at: Date.now(),
       }));
     };
     chatAction.onMessage = (payload, { peerId }) => {
-      if (!payload || typeof payload.text !== "string" || !isPlaceId(payload.place)) return;
-      const sanitized = sanitizeChatPayload(payload);
+      const sanitized = sanitizeChatPayload(payload, Date.now());
       if (!sanitized) return;
-      const entry: ChatEntry = {
-        ...sanitized,
-        authorId: peerId,
-        at: Date.now(),
-      };
-      setChats((current) => mergeChatEntries(current, [entry]));
+      setChats((current) => mergeChatEntries(current, [{ ...sanitized, authorId: peerId }]));
     };
     room.onPeerJoin = (peerId) => {
       publishPresence();
       void historyAction.request({ version: 1 }, { target: peerId, timeoutMs: 3_000 }).then((response) => {
         if (!response || !Array.isArray(response.messages)) return;
+        const now = Date.now();
         const restored = response.messages
           .slice(-OWN_CHAT_HISTORY_LIMIT)
-          .map(sanitizeChatPayload)
+          .map((item) => sanitizeChatPayload(item, now))
           .filter((item): item is ChatPayload => item !== null)
           .map((message): ChatEntry => ({ ...message, authorId: peerId }));
         if (restored.length) setChats((current) => mergeChatEntries(current, restored));
@@ -283,7 +197,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
   }, [publishPresence, connectionEpoch]);
 
   const sendChat = useCallback((rawText: string) => {
-    const text = rawText.trim().slice(0, 180);
+    const text = rawText.trim().slice(0, CHAT_TEXT_LIMIT);
     if (!text) return;
     const payload: ChatPayload = {
       id: `${selfId}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`,
@@ -365,6 +279,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   const receivedImpulseIdsRef = useRef(new Set<string>());
   const chatsRef = useRef(chats);
   const countsRef = useRef(counts);
+  const nameRef = useRef(name);
   const nearGameRef = useRef<GameId | null>(null);
   const [nearGame, setNearGame] = useState<GameId | null>(null);
   const [connected, setConnected] = useState(1);
@@ -373,6 +288,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   useEffect(() => { chatsRef.current = chats; }, [chats]);
   useEffect(() => { countsRef.current = counts; }, [counts]);
   useEffect(() => {
+    nameRef.current = name;
     const me = playersRef.current.get(selfId);
     if (me) me.name = name || "PLAYER";
   }, [name]);
@@ -389,7 +305,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     collisionTimesRef.current.clear();
     receivedImpulseIdsRef.current.clear();
     playersRef.current.set(selfId, existing ?? {
-      id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
+      id: selfId, name: nameRef.current || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, seen: Date.now(),
     });
     setConnected(1);
@@ -399,10 +315,10 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     sendStateRef.current = (state) => stateAction.send(state);
     sendImpulseRef.current = (impulse) => impulseAction.send(impulse);
     stateAction.onMessage = (state, { peerId }) => {
-      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId);
+      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, Date.now());
     };
     impulseAction.onMessage = (impulse, { peerId }) => {
-      if (!impulse || impulse.targetId !== selfId || receivedImpulseIdsRef.current.has(impulse.id)) return;
+      if (!impulse || typeof impulse.id !== "string" || impulse.targetId !== selfId || receivedImpulseIdsRef.current.has(impulse.id)) return;
       const me = playersRef.current.get(selfId);
       const source = playersRef.current.get(peerId);
       if (!me || !source || !isLobbyImpulsePlausible(me, source, impulse.vx, impulse.vy, Date.now())) return;
@@ -457,7 +373,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       steerLobbyPlayer(me, dx, dy, dt);
       me.x += me.vx * dt;
       me.y += me.vy * dt;
-      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
+      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, selfId, dt, now);
       const collisionImpulses = resolveLobbyCollisions(me, playersRef.current, now, collisionTimesRef.current);
       for (const impulse of collisionImpulses) {
         void sendImpulseRef.current?.({
@@ -493,7 +409,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <div><strong>MULTIPLAY</strong><small>LOBBY MAP</small></div>
         </div>
-        <label className="lobby-name" htmlFor="player-name"><span>PLAYER</span><input id="player-name" maxLength={14} value={name} onChange={(event) => onName(event.target.value.toUpperCase())} /></label>
+        <label className="lobby-name" htmlFor="player-name"><span>PLAYER</span><input id="player-name" maxLength={PLAYER_NAME_LIMIT} value={name} onChange={(event) => onName(event.target.value.toUpperCase())} /></label>
         <div className="play-status"><span className="online-dot" /> {connected} IN PLAZA</div>
       </header>
       <nav className="occupancy-strip" aria-label="各ゲームの参加人数">
@@ -692,7 +608,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           aria-label="チャットメッセージ"
           enterKeyHint="send"
           inputMode="text"
-          maxLength={180}
+          maxLength={CHAT_TEXT_LIMIT}
           placeholder={inputActive ? "メッセージを入力…" : "ENTER / CHAT またはここをタップして入力"}
           readOnly={!inputActive}
           rows={1}
@@ -857,20 +773,25 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
   const sendPulseRef = useRef<((pulse: Pulse) => Promise<void>) | null>(null);
   const collectedRef = useRef(new Set<string>());
   const chatsRef = useRef(chats);
+  const nameRef = useRef(name);
   const [connected, setConnected] = useState(1);
   const [scoreboard, setScoreboard] = useState<Player[]>([]);
   const color = useMemo(() => COLORS[Math.floor(Math.random() * COLORS.length)], []);
 
   useEffect(() => { chatsRef.current = chats; }, [chats]);
   useEffect(() => {
+    nameRef.current = name;
     const me = playersRef.current.get(selfId);
     if (me) me.name = name || "PLAYER";
   }, [name]);
 
+  const soundRef = useRef(sound);
+  useEffect(() => { soundRef.current = sound; }, [sound]);
+
   const playTone = useCallback((frequency: number) => {
-    if (!sound) return;
-    const AudioCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const context = new AudioCtor();
+    if (!soundRef.current) return;
+    const context = getAudioContext();
+    if (!context) return;
     const oscillator = context.createOscillator();
     const gain = context.createGain();
     oscillator.type = "square";
@@ -879,7 +800,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.09);
     oscillator.connect(gain).connect(context.destination);
     oscillator.start(); oscillator.stop(context.currentTime + 0.1);
-  }, [sound]);
+  }, []);
 
   const triggerPulse = useCallback(() => {
     if (game.id !== "pulse-push") return;
@@ -899,7 +820,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     playersRef.current.clear();
     remoteMotionsRef.current.clear();
     playersRef.current.set(selfId, existing ?? {
-      id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
+      id: selfId, name: nameRef.current || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, crown: game.initialCrown, seen: now,
     });
     setConnected(1);
@@ -910,7 +831,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     sendStateRef.current = (state) => stateAction.send(state);
     sendPulseRef.current = (pulse) => pulseAction.send(pulse);
     stateAction.onMessage = (state, { peerId }) => {
-      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId);
+      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, Date.now());
     };
     pulseAction.onMessage = (pulse) => {
       if (pulse && typeof pulse.x === "number") pulsesRef.current.push(pulse);
@@ -926,7 +847,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       sendPulseRef.current = null;
       void room.leave();
     };
-  }, [color, connectionEpoch, game.id]);
+  }, [color, connectionEpoch, game]);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -980,7 +901,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
         const { seen: _seen, ...wire } = me; void _seen;
         void sendStateRef.current?.(wire);
       }
-      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
+      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, selfId, dt, now);
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
         playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
       }
@@ -991,7 +912,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     };
     frame = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frame);
-  }, [game.id, playTone]);
+  }, [game, playTone]);
 
   return (
     <main className={`play-shell mode-${game.accent} has-chat`}>

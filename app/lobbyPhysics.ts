@@ -1,4 +1,4 @@
-import { GAME_HEIGHT, GAME_WIDTH, type PlayerState } from "./games";
+import { GAME_HEIGHT, GAME_WIDTH, type PlayerState } from "./games.ts";
 
 const PLAYER_RADIUS = 18;
 const COLLISION_DISTANCE = PLAYER_RADIUS * 2;
