@@ -71,6 +71,8 @@ footer p { color:#a7b0bb; }
 .chat-panel.expanded { width:min(580px,calc(100vw - 36px)); height:min(70dvh,620px); }
 .chat-panel.collapsed { height:44px; grid-template-rows:42px; }
 .chat-panel.collapsed .chat-log,.chat-panel.collapsed form { display:none; }
+.chat-panel.input-idle:not(.collapsed) { grid-template-rows:42px 1fr; }
+.chat-panel.input-idle form { display:none; }
 .chat-panel>header { padding:0 8px 0 12px; display:flex; align-items:center; justify-content:space-between; gap:6px; border-bottom:1px solid #2b3c52; font:800 11px monospace; letter-spacing:1px; }
 .chat-heading { min-width:0; flex:1; height:100%; padding:0; border:0; color:inherit; background:transparent; display:flex; align-items:center; text-align:left; font:800 11px monospace; letter-spacing:1px; }
 .chat-heading em { min-width:0; margin-left:10px; color:#8495a9; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:600 10px Arial,sans-serif; }.chat-heading em b { color:var(--yellow); }
@@ -154,4 +156,7 @@ html.controller-active,html.controller-active body,html.controller-active * { us
   .portal-prompt { bottom:6px; font-size:9px; }
 }
 @media (max-width:380px) { .hero h1 { font-size:48px; }.analog-stick { transform:scale(.88); transform-origin:left bottom; }.controller-actions { transform:scale(.9); transform-origin:right bottom; } }
+.chat-panel.input-active { border-color:var(--cyan); box-shadow:0 -8px 34px rgba(0,0,0,.42),0 0 30px rgba(95,224,192,.26); }
+.chat-panel.input-active>header { color:var(--cyan); background:#0d211f; }
+.chat-panel.input-active form textarea { background:#132a35; box-shadow:inset 0 0 0 1px rgba(95,224,192,.28); }
 @media (prefers-reduced-motion:reduce) { .chat-panel,.game-card { transition:none; } }

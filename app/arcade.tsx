@@ -19,6 +19,7 @@ type Player = {
   seen: number;
 };
 type WirePlayer = Omit<Player, "seen"> & { seen?: number };
+type RemoteMotion = { x: number; y: number; vx: number; vy: number; receivedAt: number };
 type Pulse = { id: string; x: number; y: number; born: number; owner: string };
 type PresencePayload = { name: string; place: PlaceId; at: number };
 type ChatPayload = { id: string; name: string; text: string; at: number; place: PlaceId };
@@ -110,6 +111,53 @@ function gems(now: number) {
     x: 70 + hash(phase * 47 + i * 3) * (WIDTH - 140),
     y: 70 + hash(phase * 53 + i * 7) * (HEIGHT - 140),
   }));
+}
+
+function receiveRemotePlayer(
+  players: Map<string, Player>,
+  motions: Map<string, RemoteMotion>,
+  state: WirePlayer,
+  peerId: string,
+) {
+  if (!state || typeof state.x !== "number" || typeof state.y !== "number") return;
+  const receivedAt = Date.now();
+  const vx = typeof state.vx === "number" ? state.vx : 0;
+  const vy = typeof state.vy === "number" ? state.vy : 0;
+  const existing = players.get(peerId);
+  if (existing) {
+    existing.name = state.name;
+    existing.color = state.color;
+    existing.score = state.score;
+    existing.crown = state.crown;
+    existing.seen = receivedAt;
+  } else {
+    players.set(peerId, { ...state, id: peerId, vx, vy, seen: receivedAt });
+  }
+  motions.set(peerId, { x: state.x, y: state.y, vx, vy, receivedAt });
+}
+
+function smoothRemotePlayers(
+  players: Map<string, Player>,
+  motions: Map<string, RemoteMotion>,
+  dt: number,
+  now: number,
+) {
+  const blend = 1 - Math.exp(-11 * dt);
+  for (const [id, motion] of motions) {
+    const player = players.get(id);
+    if (!player || id === selfId) continue;
+    const prediction = Math.min((now - motion.receivedAt) / 1000, .22);
+    const targetX = motion.x + motion.vx * prediction;
+    const targetY = motion.y + motion.vy * prediction;
+    if (Math.hypot(targetX - player.x, targetY - player.y) > 220) {
+      player.x = targetX; player.y = targetY;
+    } else {
+      player.x += (targetX - player.x) * blend;
+      player.y += (targetY - player.y) * blend;
+    }
+    player.vx += (motion.vx - player.vx) * blend;
+    player.vy += (motion.vy - player.vy) * blend;
+  }
 }
 
 function useReconnectEpoch() {
@@ -300,6 +348,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playersRef = useRef<Map<string, Player>>(new Map());
+  const remoteMotionsRef = useRef<Map<string, RemoteMotion>>(new Map());
   const keysRef = useRef(new Set<string>());
   const stickRef = useRef({ x: 0, y: 0 });
   const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
@@ -325,6 +374,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   useEffect(() => {
     const existing = playersRef.current.get(selfId);
     playersRef.current.clear();
+    remoteMotionsRef.current.clear();
     playersRef.current.set(selfId, existing ?? {
       id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, seen: Date.now(),
@@ -334,12 +384,12 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     const stateAction = room.makeAction<WirePlayer>("player-state");
     sendStateRef.current = (state) => stateAction.send(state);
     stateAction.onMessage = (state, { peerId }) => {
-      if (!state || typeof state.x !== "number" || typeof state.y !== "number") return;
-      playersRef.current.set(peerId, { ...state, id: peerId, seen: Date.now() });
+      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId);
     };
     room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
     room.onPeerLeave = (peerId) => {
       playersRef.current.delete(peerId);
+      remoteMotionsRef.current.delete(peerId);
       setConnected(Object.keys(room.getPeers()).length + 1);
     };
     return () => {
@@ -388,7 +438,10 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
         const { seen: _seen, ...wire } = me; void _seen;
         void sendStateRef.current?.(wire);
       }
-      for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) playersRef.current.delete(id);
+      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
+      for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
+        playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
+      }
       drawLobby(context, [...playersRef.current.values()], chatsRef.current, countsRef.current, closest, now);
       frame = requestAnimationFrame(loop);
     };
@@ -426,9 +479,11 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   type ChatSize = "collapsed" | "compact" | "expanded";
   const [draft, setDraft] = useState("");
   const [size, setSize] = useState<ChatSize>(() => window.matchMedia("(max-width: 600px)").matches ? "collapsed" : "compact");
+  const [inputActive, setInputActive] = useState(false);
   const [unread, setUnread] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const previousCountRef = useRef(chats.length);
   const atBottomRef = useRef(true);
   const focusHeightRef = useRef(0);
@@ -436,7 +491,10 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   const keyboardOpenRef = useRef(false);
 
   const focusChat = useCallback(() => {
-    flushSync(() => setSize("compact"));
+    flushSync(() => {
+      setSize((current) => current === "collapsed" ? "compact" : current);
+      setInputActive(true);
+    });
     inputRef.current?.focus({ preventScroll: true });
   }, []);
 
@@ -532,17 +590,22 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   const latest = [...chats].reverse().find((chat) => !chat.system);
 
   return (
-    <aside className={`chat-panel ${size}`} aria-label="全体チャット">
+    <aside className={`chat-panel ${size} ${inputActive ? "input-active" : "input-idle"}`} aria-label="全体チャット">
       <header>
         <button className="chat-heading" type="button" onClick={size === "collapsed" ? openChat : undefined} aria-expanded={size !== "collapsed"}>
-          <span className="online-dot" /><strong>GLOBAL CHAT</strong>
+          <span className="online-dot" /><strong>{inputActive ? "TYPING" : "GLOBAL CHAT"}</strong>
           {size === "collapsed" && latest && <em><b>{latest.name}</b> {latest.text}</em>}
           {unread > 0 && <i className="unread-badge">{unread > 99 ? "99+" : unread}</i>}
         </button>
         <div className="chat-tools">
           <small>{PLACES.find((item) => item.id === place)?.shortTitle}</small>
+          {size !== "collapsed" && <button type="button" onClick={focusChat} aria-label="メッセージを入力する">✎</button>}
           {size !== "collapsed" && <button type="button" onClick={() => setSize(size === "expanded" ? "compact" : "expanded")} aria-label={size === "expanded" ? "チャットを通常サイズに戻す" : "チャットを拡大する"}>{size === "expanded" ? "↙" : "↗"}</button>}
-          <button type="button" onClick={() => setSize(size === "collapsed" ? "compact" : "collapsed")} aria-label={size === "collapsed" ? "チャットを開く" : "チャットを最小化する"}>{size === "collapsed" ? "+" : "−"}</button>
+          <button type="button" onClick={() => {
+            const collapsing = size !== "collapsed";
+            setSize(collapsing ? "collapsed" : "compact");
+            if (collapsing) { inputRef.current?.blur(); setInputActive(false); }
+          }} aria-label={size === "collapsed" ? "チャットを開く" : "チャットを最小化する"}>{size === "collapsed" ? "+" : "−"}</button>
         </div>
       </header>
       <div className="chat-log" ref={logRef} onScroll={handleScroll} aria-live="polite">
@@ -553,7 +616,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           </div>
         ))}
       </div>
-      <form onSubmit={submit}>
+      <form ref={formRef} onSubmit={submit}>
         <textarea
           ref={inputRef}
           aria-label="チャットメッセージ"
@@ -565,6 +628,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onFocus={() => {
+            setInputActive(true);
             focusHeightRef.current = Math.max(restingHeightRef.current, window.visualViewport?.height ?? window.innerHeight);
             if (size === "collapsed") setSize("compact");
             requestAnimationFrame(() => {
@@ -574,7 +638,10 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           }}
           onBlur={() => {
             focusHeightRef.current = 0;
-            requestAnimationFrame(updateKeyboardState);
+            requestAnimationFrame(() => {
+              updateKeyboardState();
+              if (!formRef.current?.contains(document.activeElement)) setInputActive(false);
+            });
           }}
           onKeyDown={(event) => {
             event.stopPropagation();
@@ -698,6 +765,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playersRef = useRef<Map<string, Player>>(new Map());
+  const remoteMotionsRef = useRef<Map<string, RemoteMotion>>(new Map());
   const pulsesRef = useRef<Pulse[]>([]);
   const keysRef = useRef(new Set<string>());
   const stickRef = useRef({ x: 0, y: 0 });
@@ -745,6 +813,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     const now = Date.now();
     const existing = playersRef.current.get(selfId);
     playersRef.current.clear();
+    remoteMotionsRef.current.clear();
     playersRef.current.set(selfId, existing ?? {
       id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, crown: game.id === "crown-chase", seen: now,
@@ -757,8 +826,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     sendStateRef.current = (state) => stateAction.send(state);
     sendPulseRef.current = (pulse) => pulseAction.send(pulse);
     stateAction.onMessage = (state, { peerId }) => {
-      if (!state || typeof state.x !== "number" || typeof state.y !== "number") return;
-      playersRef.current.set(peerId, { ...state, id: peerId, seen: Date.now() });
+      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId);
     };
     pulseAction.onMessage = (pulse) => {
       if (pulse && typeof pulse.x === "number") pulsesRef.current.push(pulse);
@@ -766,6 +834,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
     room.onPeerLeave = (peerId) => {
       playersRef.current.delete(peerId);
+      remoteMotionsRef.current.delete(peerId);
       setConnected(Object.keys(room.getPeers()).length + 1);
     };
     return () => {
@@ -854,7 +923,10 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
         const { seen: _seen, ...wire } = me; void _seen;
         void sendStateRef.current?.(wire);
       }
-      for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) playersRef.current.delete(id);
+      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
+      for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
+        playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
+      }
       if (time - lastBoard > 300) { lastBoard = time; setScoreboard([...playersRef.current.values()].sort((a, b) => b.score - a.score)); }
 
       drawGame(context, game.id, [...playersRef.current.values()], pulsesRef.current, collectedRef.current, chatsRef.current, now);
