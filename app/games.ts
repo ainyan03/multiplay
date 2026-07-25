@@ -1,6 +1,4 @@
-import { boundedString, finite, record } from "./validate.ts";
-
-export type GameId = "gem-sprint" | "crown-chase" | "pulse-push";
+export type GameId = "gem-sprint" | "crown-chase" | "blast-grid";
 export type PlaceId = "lobby" | GameId;
 
 export const PLAYER_NAME_LIMIT = 14;
@@ -18,15 +16,12 @@ export type PlayerState = {
   seen: number;
 };
 
-export type PulseState = { id: string; x: number; y: number; born: number; owner: string };
-
 export const GAME_WIDTH = 960;
 export const GAME_HEIGHT = 540;
 
 export type GameUpdateContext = {
   me: PlayerState;
   players: Map<string, PlayerState>;
-  pulses: PulseState[];
   collected: Set<string>;
   now: number;
   dt: number;
@@ -36,7 +31,6 @@ export type GameUpdateContext = {
 
 export type GameDrawContext = {
   context: CanvasRenderingContext2D;
-  pulses: PulseState[];
   collected: Set<string>;
   now: number;
 };
@@ -51,11 +45,16 @@ export type GameDefinition = {
   players: string;
   accent: string;
   portal: { x: number; y: number; color: string };
-  action?: "pulse";
+  action?: "bomb";
   actionLabel: string;
   initialCrown?: boolean;
-  update: (state: GameUpdateContext) => void;
-  draw: (state: GameDrawContext) => void;
+  /**
+   * "arena" games run their own simulation loop in the game screen: they need
+   * wall collision and a shared clock, which the free-floating games do not.
+   */
+  kind?: "arena";
+  update?: (state: GameUpdateContext) => void;
+  draw?: (state: GameDrawContext) => void;
 };
 
 function hash(seed: number) {
@@ -90,17 +89,6 @@ function drawGems({ context, collected, now }: GameDrawContext) {
     context.fillStyle = "#f9e547";
     context.fillRect(-9, -9, 18, 18);
     context.restore();
-  }
-}
-
-function drawPulses({ context, pulses, now }: GameDrawContext) {
-  for (const pulse of pulses) {
-    const radius = 25 + (now - pulse.born) * .32;
-    context.beginPath();
-    context.arc(pulse.x, pulse.y, radius, 0, Math.PI * 2);
-    context.strokeStyle = `rgba(255,107,138,${Math.max(0, 1 - (now - pulse.born) / 750)})`;
-    context.lineWidth = 10;
-    context.stroke();
   }
 }
 
@@ -159,39 +147,18 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
     draw: () => undefined,
   },
   {
-    id: "pulse-push",
-    icon: "◎",
-    title: "PULSE PUSH",
-    shortTitle: "PULSE",
-    subtitle: "はじき出しバトル",
-    description: "パルスでライバルを押し出せ。落ちてもすぐ復帰できる、にぎやかなサバイバル。",
-    players: "2–8人",
+    id: "blast-grid",
+    icon: "✸",
+    title: "BLAST GRID",
+    shortTitle: "BLAST",
+    subtitle: "爆風で切り拓く迷路",
+    description: "壊せるブロックを爆風で吹き飛ばし、敵と他プレイヤーを巻き込め。倒れてもすぐ復帰できる、出入り自由の常設アリーナ。",
+    players: "1人〜",
     accent: "cyan",
-    portal: { x: 480, y: 430, color: "#5fe0c0" },
-    action: "pulse",
-    actionLabel: "PULSE",
-    update: ({ me, pulses, now, dt, selfId, playTone }) => {
-      const outside = me.x < 25 || me.x > GAME_WIDTH - 25 || me.y < 25 || me.y > GAME_HEIGHT - 25;
-      if (outside) {
-        me.x = GAME_WIDTH / 2;
-        me.y = GAME_HEIGHT / 2;
-        me.vx = me.vy = 0;
-        me.score = Math.max(0, me.score - 1);
-        playTone(70);
-      }
-      for (const pulse of pulses) {
-        if (pulse.owner === selfId) continue;
-        const age = now - pulse.born;
-        const radius = 25 + age * .32;
-        const distance = Math.hypot(me.x - pulse.x, me.y - pulse.y);
-        if (distance > radius - 18 && distance < radius + 18) {
-          me.vx += (me.x - pulse.x) / Math.max(distance, 1) * 18;
-          me.vy += (me.y - pulse.y) / Math.max(distance, 1) * 18;
-        }
-      }
-      me.score += dt;
-    },
-    draw: drawPulses,
+    portal: { x: 480, y: 430, color: "#ff9d4d" },
+    action: "bomb",
+    actionLabel: "BOMB",
+    kind: "arena",
   },
 ];
 
@@ -199,15 +166,3 @@ export function isPlaceId(value: unknown): value is PlaceId {
   return value === "lobby" || GAME_DEFINITIONS.some((game) => game.id === value);
 }
 
-export const PULSE_LIFETIME_MS = 750;
-
-// `owner` decides whose pulse skips its own hit test, so it is pinned to the
-// peer the message actually arrived from rather than taken from the payload.
-export function sanitizePulse(value: unknown, peerId: string, now: number): PulseState | null {
-  const item = record(value);
-  if (!item) return null;
-  if (!boundedString(item.id, 160)) return null;
-  if (!finite(item.x, -64, GAME_WIDTH + 64) || !finite(item.y, -64, GAME_HEIGHT + 64)) return null;
-  if (!finite(item.born, now - PULSE_LIFETIME_MS, now + PULSE_LIFETIME_MS)) return null;
-  return { id: item.id, x: item.x, y: item.y, born: item.born, owner: peerId };
-}

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sanitizePulse } from "../app/games.ts";
 import { isNewerVersion, parseLobbyImpulse, parsePresence, PROTO_VERSION } from "../app/protocol.ts";
 import { boundedString, finite, integer, record } from "../app/validate.ts";
 
@@ -58,18 +57,3 @@ test("parseLobbyImpulse only accepts impulses addressed to us", () => {
   assert.equal(parseLobbyImpulse({ ...base, vy: Number.NaN }, "self"), null);
 });
 
-test("sanitizePulse pins ownership to the sending peer", () => {
-  const parsed = sanitizePulse({ id: "p1", x: 10, y: 20, born: NOW, owner: "victim" }, "attacker", NOW);
-  assert.ok(parsed);
-  assert.equal(parsed.owner, "attacker", "a peer cannot attribute its pulse to someone else");
-});
-
-test("sanitizePulse rejects out-of-range and out-of-window pulses", () => {
-  const base = { id: "p1", x: 10, y: 20, born: NOW };
-  assert.ok(sanitizePulse(base, "peer", NOW));
-  assert.equal(sanitizePulse({ ...base, x: 99_999 }, "peer", NOW), null);
-  assert.equal(sanitizePulse({ ...base, born: NOW - 60_000 }, "peer", NOW), null, "stale beyond its lifetime");
-  assert.equal(sanitizePulse({ ...base, born: NOW + 60_000 }, "peer", NOW), null, "born too far in the future");
-  assert.equal(sanitizePulse({ ...base, id: "" }, "peer", NOW), null);
-  assert.equal(sanitizePulse(null, "peer", NOW), null);
-});
