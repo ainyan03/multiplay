@@ -45,20 +45,24 @@ type Pulse = PulseState;
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
-// Losing every peer without a leave event is the signature of a relay that
-// failed quietly, so a rejoin is worth the churn. Before the first peer is met
-// the same emptiness just means nobody else is here yet, and rejoining would
-// abort the discovery already in flight -- hence the much longer cold grace.
-const ISOLATION_TIMEOUT_MS = 20_000;
-const COLD_START_TIMEOUT_MS = 90_000;
-const MAX_ISOLATION_BACKOFF_MS = 300_000;
-
 // Monotonic across room changes and rejoins, so a peer that reconnects is never
 // mistaken for one replaying old updates.
 let stateSeq = 0;
 function nextStateSeq() {
   stateSeq += 1;
   return stateSeq;
+}
+
+// Rejoining before the first peer is met corrupts discovery instead of helping
+// it. Trystero keys relay subscriptions by topic without reference counting, so
+// while the initial subscribe is still in flight, a leave/join pair resolves as
+// subscribe, subscribe, unsubscribe -- and the trailing unsubscribe cancels the
+// subscription the new room just made. The tab then announces itself forever
+// while listening to nothing. Once a peer has answered, the subscribe has
+// settled and the same sequence is ordered safely.
+let hasMetPeer = false;
+function notePeerMet() {
+  hasMetPeer = true;
 }
 const LOBBY = {
   id: "lobby" as const,
@@ -95,6 +99,7 @@ function useReconnectEpoch() {
   const [epoch, setEpoch] = useState(0);
   const lastReconnectRef = useRef(0);
   const requestReconnect = useCallback(() => {
+    if (!hasMetPeer) return;
     const now = Date.now();
     if (now - lastReconnectRef.current < 800) return;
     lastReconnectRef.current = now;
@@ -121,7 +126,7 @@ function useReconnectEpoch() {
   return { epoch, requestReconnect };
 }
 
-function useCommunity(name: string, place: PlaceId, connectionEpoch: number, requestReconnect: () => void) {
+function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
   const [initialOwnHistory] = useState(loadOwnChatHistory);
   const ownHistoryRef = useRef<ChatPayload[]>(initialOwnHistory);
   const [presence, setPresence] = useState<Map<string, PresencePayload>>(() => new Map());
@@ -138,8 +143,6 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number, req
   const sendPresenceRef = useRef<((payload: PresencePayload) => Promise<void>) | null>(null);
   const sendChatRef = useRef<((payload: ChatPayload) => Promise<void>) | null>(null);
   const identityRef = useRef({ name, place });
-  const isolationBackoffRef = useRef(ISOLATION_TIMEOUT_MS);
-  const metPeerRef = useRef(false);
 
   const publishPresence = useCallback(() => {
     const payload: PresencePayload = {
@@ -189,6 +192,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number, req
       setChats((current) => mergeChatEntries(current, [{ ...sanitized, authorId: peerId }]));
     };
     room.onPeerJoin = (peerId) => {
+      notePeerMet();
       publishPresence();
       void historyAction.request({ version: 1 }, { target: peerId, timeoutMs: 3_000 }).then((response) => {
         const messages = sanitizeChatHistory(response, Date.now());
@@ -214,23 +218,6 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number, req
       setPresence((current) => new Map([...current].filter(([id, item]) => id === selfId || item.at >= cutoff)));
     }, 5_000);
 
-    let isolatedSince = 0;
-    const watchdog = window.setInterval(() => {
-      if (Object.keys(room.getPeers()).length > 0) {
-        isolatedSince = 0;
-        metPeerRef.current = true;
-        isolationBackoffRef.current = ISOLATION_TIMEOUT_MS;
-        return;
-      }
-      const now = Date.now();
-      if (!isolatedSince) { isolatedSince = now; return; }
-      const grace = Math.max(isolationBackoffRef.current, metPeerRef.current ? 0 : COLD_START_TIMEOUT_MS);
-      if (now - isolatedSince < grace) return;
-      isolatedSince = 0;
-      isolationBackoffRef.current = Math.min(Math.max(isolationBackoffRef.current, grace) * 2, MAX_ISOLATION_BACKOFF_MS);
-      requestReconnect();
-    }, 5_000);
-
     const onPageHide = () => { void room.leave(); };
     window.addEventListener("pagehide", onPageHide);
 
@@ -238,12 +225,11 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number, req
       window.removeEventListener("pagehide", onPageHide);
       window.clearInterval(presenceTimer);
       window.clearInterval(cleanupTimer);
-      window.clearInterval(watchdog);
       sendPresenceRef.current = null;
       sendChatRef.current = null;
       void room.leave();
     };
-  }, [publishPresence, connectionEpoch, requestReconnect]);
+  }, [publishPresence, connectionEpoch]);
 
   const sendChat = useCallback((rawText: string) => {
     const text = rawText.trim().slice(0, CHAT_TEXT_LIMIT);
@@ -282,9 +268,9 @@ export function Arcade() {
   const [gameId, setGameId] = useState<GameId | null>(null);
   const [name, setName] = useState(() => `PLAYER-${Math.floor(100 + Math.random() * 900)}`);
   const [sound, setSound] = useState(true);
-  const { epoch: connectionEpoch, requestReconnect } = useReconnectEpoch();
+  const { epoch: connectionEpoch } = useReconnectEpoch();
   const place: PlaceId = gameId ?? "lobby";
-  const community = useCommunity(name, place, connectionEpoch, requestReconnect);
+  const community = useCommunity(name, place, connectionEpoch);
   const selected = GAMES.find((game) => game.id === gameId);
 
   useEffect(() => {
@@ -399,6 +385,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       applyLobbyImpulse(me, impulse.vx, impulse.vy);
     };
     room.onPeerJoin = () => {
+      notePeerMet();
       setConnected(Object.keys(room.getPeers()).length + 1);
       broadcastState();
     };
@@ -933,6 +920,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       if (pulse) pulsesRef.current.push(pulse);
     };
     room.onPeerJoin = () => {
+      notePeerMet();
       setConnected(Object.keys(room.getPeers()).length + 1);
       broadcastState();
     };
