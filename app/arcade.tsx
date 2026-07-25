@@ -12,7 +12,7 @@ import {
   type PlayerState,
   type PulseState,
 } from "./games";
-import { applyLobbyImpulse, resolveLobbyCollisions } from "./lobbyPhysics";
+import { applyLobbyImpulse, isLobbyImpulsePlausible, resolveLobbyCollisions, steerLobbyPlayer } from "./lobbyPhysics";
 
 type PlaceId = "lobby" | GameId;
 type Player = PlayerState;
@@ -330,17 +330,17 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     stateAction.onMessage = (state, { peerId }) => {
       receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId);
     };
-    impulseAction.onMessage = (impulse) => {
+    impulseAction.onMessage = (impulse, { peerId }) => {
       if (!impulse || impulse.targetId !== selfId || receivedImpulseIdsRef.current.has(impulse.id)) return;
-      if (!Number.isFinite(impulse.vx) || !Number.isFinite(impulse.vy) || Math.abs(Date.now() - impulse.at) > 2_000) return;
-      if (Math.hypot(impulse.vx, impulse.vy) > 430) return;
+      const me = playersRef.current.get(selfId);
+      const source = playersRef.current.get(peerId);
+      if (!me || !source || !isLobbyImpulsePlausible(me, source, impulse.vx, impulse.vy, Date.now())) return;
       receivedImpulseIdsRef.current.add(impulse.id);
       if (receivedImpulseIdsRef.current.size > 128) {
         const oldest = receivedImpulseIdsRef.current.values().next().value;
         if (oldest) receivedImpulseIdsRef.current.delete(oldest);
       }
-      const me = playersRef.current.get(selfId);
-      if (me) applyLobbyImpulse(me, impulse.vx, impulse.vy);
+      applyLobbyImpulse(me, impulse.vx, impulse.vy);
     };
     room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
     room.onPeerLeave = (peerId) => {
@@ -383,9 +383,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       const keyboardLength = Math.hypot(keyboardX, keyboardY) || 1;
       const dx = keyboardX ? keyboardX / keyboardLength : stickRef.current.x;
       const dy = keyboardY ? keyboardY / keyboardLength : stickRef.current.y;
-      me.vx += (dx * 285 - me.vx) * Math.min(dt * 9, 1);
-      me.vy += (dy * 285 - me.vy) * Math.min(dt * 9, 1);
-      if (!dx) me.vx *= Math.pow(.01, dt); if (!dy) me.vy *= Math.pow(.01, dt);
+      steerLobbyPlayer(me, dx, dy, dt);
       me.x += me.vx * dt;
       me.y += me.vy * dt;
       smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);

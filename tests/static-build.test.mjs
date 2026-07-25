@@ -35,6 +35,8 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.match(gameDefinitions, /GAME_DEFINITIONS/);
   assert.match(lobbyPhysics, /resolveLobbyCollisions/);
   assert.match(lobbyPhysics, /applyLobbyImpulse/);
+  assert.match(lobbyPhysics, /steerLobbyPlayer/);
+  assert.match(lobbyPhysics, /isLobbyImpulsePlausible/);
   assert.match(lobbyPhysics, /RESTITUTION/);
   assert.ok(scripts.some((source) => source.includes("collision-impulse-v1")));
   assert.ok(scripts.some((source) => source.includes("LOBBY MAP")));
