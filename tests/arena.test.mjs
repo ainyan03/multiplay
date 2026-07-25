@@ -116,6 +116,25 @@ test("a blast clears one soft block and no further", () => {
   assert.equal(snapshot.blasts.has(cellIndex(found.col + 2, found.row)), false, "and does not catch fire");
 });
 
+test("blocks stay put while the fuse is still burning", () => {
+  const blocks = buildSoftBlocks();
+  let target = null;
+  for (let row = 1; row < ROWS - 1 && !target; row += 1) {
+    for (let col = 1; col < COLS - 2; col += 1) {
+      if (!isHardWall(col, row) && !blocks.has(cellIndex(col, row)) && blocks.has(cellIndex(col + 1, row))) {
+        target = { col, row }; break;
+      }
+    }
+  }
+  assert.ok(target);
+  const doomed = cellIndex(target.col + 1, target.row);
+  const bombs = [bomb("b1", target.col, target.row, T0)];
+
+  assert.equal(arenaAt(bombs, T0).softBlocks.has(doomed), true, "the block is intact when the bomb lands");
+  assert.equal(arenaAt(bombs, T0 + FUSE_MS - 1).softBlocks.has(doomed), true, "and right up to the last moment");
+  assert.equal(arenaAt(bombs, T0 + FUSE_MS).softBlocks.has(doomed), false, "only the blast removes it");
+});
+
 test("a broken block grows back on schedule", () => {
   const blocks = buildSoftBlocks();
   let target = null;
