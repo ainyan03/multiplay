@@ -112,7 +112,35 @@ function gems(now: number) {
   }));
 }
 
-function useCommunity(name: string, place: PlaceId) {
+function useReconnectEpoch() {
+  const [epoch, setEpoch] = useState(0);
+  useEffect(() => {
+    let wasHidden = document.hidden;
+    let lastReconnect = 0;
+    const reconnect = () => {
+      const now = Date.now();
+      if (now - lastReconnect < 800) return;
+      lastReconnect = now;
+      setEpoch((current) => current + 1);
+    };
+    const onVisibility = () => {
+      if (document.hidden) { wasHidden = true; return; }
+      if (wasHidden) { wasHidden = false; reconnect(); }
+    };
+    const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) reconnect(); };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onPageShow);
+    window.addEventListener("online", reconnect);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onPageShow);
+      window.removeEventListener("online", reconnect);
+    };
+  }, []);
+  return epoch;
+}
+
+function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
   const [presence, setPresence] = useState<Map<string, PresencePayload>>(() => new Map());
   const [chats, setChats] = useState<ChatEntry[]>(() => [{
     id: "welcome",
@@ -143,6 +171,12 @@ function useCommunity(name: string, place: PlaceId) {
   }, [name, place, publishPresence]);
 
   useEffect(() => {
+    const localPresence: PresencePayload = {
+      name: identityRef.current.name || "PLAYER",
+      place: identityRef.current.place,
+      at: Date.now(),
+    };
+    setPresence(new Map([[selfId, localPresence]]));
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "community-hub");
     const presenceAction = room.makeAction<PresencePayload>("presence-v1");
     const chatAction = room.makeAction<ChatPayload>("chat-v1");
@@ -192,7 +226,7 @@ function useCommunity(name: string, place: PlaceId) {
       sendChatRef.current = null;
       void room.leave();
     };
-  }, [publishPresence]);
+  }, [publishPresence, connectionEpoch]);
 
   const sendChat = useCallback((rawText: string) => {
     const text = rawText.trim().slice(0, 180);
@@ -221,8 +255,9 @@ export function Arcade() {
   const [gameId, setGameId] = useState<GameId | null>(null);
   const [name, setName] = useState(() => `PLAYER-${Math.floor(100 + Math.random() * 900)}`);
   const [sound, setSound] = useState(true);
+  const connectionEpoch = useReconnectEpoch();
   const place: PlaceId = gameId ?? "lobby";
-  const community = useCommunity(name, place);
+  const community = useCommunity(name, place, connectionEpoch);
   const selected = GAMES.find((game) => game.id === gameId);
 
   useEffect(() => {
@@ -243,27 +278,30 @@ export function Arcade() {
           sound={sound}
           chats={community.chats}
           counts={community.counts}
+          connectionEpoch={connectionEpoch}
           onSound={() => setSound((value) => !value)}
           onLeave={() => setGameId(null)}
         />
       ) : (
-        <LobbyScreen name={name} chats={community.chats} counts={community.counts} onName={setName} onJoin={setGameId} />
+        <LobbyScreen name={name} chats={community.chats} counts={community.counts} connectionEpoch={connectionEpoch} onName={setName} onJoin={setGameId} />
       )}
       <ChatPanel chats={community.chats} place={place} onSend={community.sendChat} />
     </>
   );
 }
 
-function LobbyScreen({ name, chats, counts, onName, onJoin }: {
+function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   name: string;
   chats: ChatEntry[];
   counts: Record<PlaceId, number>;
+  connectionEpoch: number;
   onName: (name: string) => void;
   onJoin: (id: GameId) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playersRef = useRef<Map<string, Player>>(new Map());
   const keysRef = useRef(new Set<string>());
+  const stickRef = useRef({ x: 0, y: 0 });
   const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
   const chatsRef = useRef(chats);
   const countsRef = useRef(counts);
@@ -279,19 +317,19 @@ function LobbyScreen({ name, chats, counts, onName, onJoin }: {
     if (me) me.name = name || "PLAYER";
   }, [name]);
 
-  const setTouchKey = useCallback((key: string, pressed: boolean) => {
-    if (pressed) keysRef.current.add(key);
-    else keysRef.current.delete(key);
-  }, []);
+  const setStick = useCallback((x: number, y: number) => { stickRef.current = { x, y }; }, []);
   const enterPortal = useCallback(() => {
     if (nearGameRef.current) onJoin(nearGameRef.current);
   }, [onJoin]);
 
   useEffect(() => {
-    playersRef.current.set(selfId, {
+    const existing = playersRef.current.get(selfId);
+    playersRef.current.clear();
+    playersRef.current.set(selfId, existing ?? {
       id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, seen: Date.now(),
     });
+    setConnected(1);
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "public-lobby");
     const stateAction = room.makeAction<WirePlayer>("player-state");
     sendStateRef.current = (state) => stateAction.send(state);
@@ -307,9 +345,8 @@ function LobbyScreen({ name, chats, counts, onName, onJoin }: {
     return () => {
       sendStateRef.current = null;
       void room.leave();
-      playersRef.current.clear();
     };
-  }, [color]);
+  }, [color, connectionEpoch]);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -334,11 +371,13 @@ function LobbyScreen({ name, chats, counts, onName, onJoin }: {
       const me = playersRef.current.get(selfId);
       if (!me) { frame = requestAnimationFrame(loop); return; }
       const keys = keysRef.current;
-      const dx = Number(keys.has("d") || keys.has("arrowright")) - Number(keys.has("a") || keys.has("arrowleft"));
-      const dy = Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
-      const length = Math.hypot(dx, dy) || 1;
-      me.vx += (dx / length * 285 - me.vx) * Math.min(dt * 9, 1);
-      me.vy += (dy / length * 285 - me.vy) * Math.min(dt * 9, 1);
+      const keyboardX = Number(keys.has("d") || keys.has("arrowright")) - Number(keys.has("a") || keys.has("arrowleft"));
+      const keyboardY = Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
+      const keyboardLength = Math.hypot(keyboardX, keyboardY) || 1;
+      const dx = keyboardX ? keyboardX / keyboardLength : stickRef.current.x;
+      const dy = keyboardY ? keyboardY / keyboardLength : stickRef.current.y;
+      me.vx += (dx * 285 - me.vx) * Math.min(dt * 9, 1);
+      me.vy += (dy * 285 - me.vy) * Math.min(dt * 9, 1);
       if (!dx) me.vx *= Math.pow(.01, dt); if (!dy) me.vy *= Math.pow(.01, dt);
       me.x = Math.max(25, Math.min(WIDTH - 25, me.x + me.vx * dt));
       me.y = Math.max(28, Math.min(HEIGHT - 28, me.y + me.vy * dt));
@@ -377,7 +416,7 @@ function LobbyScreen({ name, chats, counts, onName, onJoin }: {
           {nearby ? <><b>{nearby.icon} {nearby.title}</b><span><kbd>SPACE</kbd> または <kbd>A</kbd> で入る</span></> : <span>入口まで歩いてゲームを選ぼう</span>}
         </div>
       </section>
-      <MobileController onDirection={setTouchKey} onAction={nearGame ? enterPortal : undefined} actionLabel="A" />
+      <MobileController onMove={setStick} onAction={nearGame ? enterPortal : undefined} actionLabel="A" />
       <div className="controls-bar lobby-controls"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span><span><kbd>SPACE</kbd> 入口に入る</span><p>マップ上の入口に近づくと、参加中の人数とゲーム名を確認できます。</p></div>
     </main>
   );
@@ -392,6 +431,20 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const previousCountRef = useRef(chats.length);
   const atBottomRef = useRef(true);
+  const focusHeightRef = useRef(0);
+  const restingHeightRef = useRef(window.visualViewport?.height ?? window.innerHeight);
+  const keyboardOpenRef = useRef(false);
+
+  const updateKeyboardState = useCallback(() => {
+    const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+    const focused = document.activeElement === inputRef.current;
+    if (!focused) restingHeightRef.current = viewportHeight;
+    const baseline = Math.max(focusHeightRef.current, restingHeightRef.current);
+    const keyboardOpen = focused && baseline - viewportHeight > 100;
+    document.documentElement.classList.toggle("screen-keyboard-open", keyboardOpen);
+    if (keyboardOpen && !keyboardOpenRef.current) window.dispatchEvent(new Event("multiplay:controller-reset"));
+    keyboardOpenRef.current = keyboardOpen;
+  }, []);
 
   useEffect(() => {
     const log = logRef.current;
@@ -425,9 +478,21 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
     window.addEventListener("multiplay:chat-focus", focusChat);
     return () => {
       window.removeEventListener("multiplay:chat-focus", focusChat);
-      document.documentElement.classList.remove("chat-input-focused");
+      document.documentElement.classList.remove("screen-keyboard-open");
     };
   }, []);
+
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    viewport?.addEventListener("resize", updateKeyboardState);
+    viewport?.addEventListener("scroll", updateKeyboardState);
+    window.addEventListener("resize", updateKeyboardState);
+    return () => {
+      viewport?.removeEventListener("resize", updateKeyboardState);
+      viewport?.removeEventListener("scroll", updateKeyboardState);
+      window.removeEventListener("resize", updateKeyboardState);
+    };
+  }, [updateKeyboardState]);
 
   const sendDraft = () => {
     if (!draft.trim()) return;
@@ -490,11 +555,17 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onFocus={() => {
-            document.documentElement.classList.add("chat-input-focused");
+            focusHeightRef.current = Math.max(restingHeightRef.current, window.visualViewport?.height ?? window.innerHeight);
             if (size === "collapsed") setSize("compact");
-            requestAnimationFrame(() => inputRef.current?.scrollIntoView({ block: "nearest" }));
+            requestAnimationFrame(() => {
+              inputRef.current?.scrollIntoView({ block: "nearest" });
+              updateKeyboardState();
+            });
           }}
-          onBlur={() => document.documentElement.classList.remove("chat-input-focused")}
+          onBlur={() => {
+            focusHeightRef.current = 0;
+            requestAnimationFrame(updateKeyboardState);
+          }}
           onKeyDown={(event) => {
             event.stopPropagation();
             if (event.key === "Enter" && !event.shiftKey) {
@@ -509,39 +580,107 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   );
 }
 
-function MobileController({ onDirection, onAction, actionLabel }: {
-  onDirection: (key: string, pressed: boolean) => void;
+function MobileController({ onMove, onAction, actionLabel }: {
+  onMove: (x: number, y: number) => void;
   onAction?: () => void;
   actionLabel: string;
 }) {
-  const directionProps = (key: string) => ({
-    onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => { event.currentTarget.setPointerCapture(event.pointerId); onDirection(key, true); },
-    onPointerUp: () => onDirection(key, false),
-    onPointerCancel: () => onDirection(key, false),
-    onLostPointerCapture: () => onDirection(key, false),
-  });
+  const baseRef = useRef<HTMLDivElement>(null);
+  const pointerRef = useRef<number | null>(null);
+  const [knob, setKnob] = useState({ x: 0, y: 0 });
+
+  const resetStick = useCallback(() => {
+    pointerRef.current = null;
+    setKnob({ x: 0, y: 0 });
+    onMove(0, 0);
+    document.documentElement.classList.remove("controller-active");
+  }, [onMove]);
+
+  const updateStick = useCallback((clientX: number, clientY: number) => {
+    const rect = baseRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const radius = Math.min(rect.width, rect.height) * .34;
+    const rawX = clientX - (rect.left + rect.width / 2);
+    const rawY = clientY - (rect.top + rect.height / 2);
+    const distance = Math.hypot(rawX, rawY);
+    const scale = distance > radius ? radius / distance : 1;
+    const x = rawX * scale; const y = rawY * scale;
+    const strength = Math.min(1, distance / radius);
+    const adjusted = strength < .12 ? 0 : (strength - .12) / .88;
+    setKnob({ x, y });
+    onMove(distance ? rawX / distance * adjusted : 0, distance ? rawY / distance * adjusted : 0);
+    document.getSelection()?.removeAllRanges();
+  }, [onMove]);
+
+  useEffect(() => {
+    const onVisibility = () => { if (document.hidden) resetStick(); };
+    window.addEventListener("blur", resetStick);
+    window.addEventListener("multiplay:controller-reset", resetStick);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      resetStick();
+      window.removeEventListener("blur", resetStick);
+      window.removeEventListener("multiplay:controller-reset", resetStick);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [resetStick]);
+
+  const startStick = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    if (pointerRef.current !== null) return;
+    pointerRef.current = event.pointerId;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    document.documentElement.classList.add("controller-active");
+    document.getSelection()?.removeAllRanges();
+    updateStick(event.clientX, event.clientY);
+  };
+  const moveStick = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (pointerRef.current !== event.pointerId) return;
+    event.preventDefault();
+    updateStick(event.clientX, event.clientY);
+  };
+  const endStick = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (pointerRef.current !== event.pointerId) return;
+    event.preventDefault();
+    resetStick();
+  };
+
   return (
     <div className="mobile-controller" aria-label="スマートフォン用仮想コントローラ">
-      <div className="controller-dpad">
-        <button className="up" aria-label="上へ移動" {...directionProps("arrowup")}>▲</button>
-        <button className="left" aria-label="左へ移動" {...directionProps("arrowleft")}>◀</button>
-        <button className="down" aria-label="下へ移動" {...directionProps("arrowdown")}>▼</button>
-        <button className="right" aria-label="右へ移動" {...directionProps("arrowright")}>▶</button>
+      <div
+        className="analog-stick"
+        ref={baseRef}
+        role="slider"
+        aria-label="移動用アナログスティック"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(Math.min(1, Math.hypot(knob.x, knob.y) / 45) * 100)}
+        tabIndex={-1}
+        onPointerDown={startStick}
+        onPointerMove={moveStick}
+        onPointerUp={endStick}
+        onPointerCancel={endStick}
+        onLostPointerCapture={endStick}
+        onContextMenu={(event) => event.preventDefault()}
+      >
+        <span className="stick-ring" />
+        <span className="stick-knob" style={{ transform: `translate(${knob.x}px,${knob.y}px)` }} />
       </div>
       <div className="controller-actions">
-        <button className="chat-action" type="button" onPointerDown={() => window.dispatchEvent(new Event("multiplay:chat-focus"))}>CHAT</button>
-        <button className="primary-action" type="button" disabled={!onAction} onPointerDown={onAction}>{actionLabel}</button>
+        <button className="chat-action" type="button" onPointerDown={(event) => { event.preventDefault(); window.dispatchEvent(new Event("multiplay:chat-focus")); }}>CHAT</button>
+        <button className="primary-action" type="button" disabled={!onAction} onPointerDown={(event) => { event.preventDefault(); onAction?.(); }}>{actionLabel}</button>
       </div>
     </div>
   );
 }
 
-function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
+function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound, onLeave }: {
   game: (typeof GAMES)[number];
   name: string;
   sound: boolean;
   chats: ChatEntry[];
   counts: Record<PlaceId, number>;
+  connectionEpoch: number;
   onSound: () => void;
   onLeave: () => void;
 }) {
@@ -549,6 +688,7 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
   const playersRef = useRef<Map<string, Player>>(new Map());
   const pulsesRef = useRef<Pulse[]>([]);
   const keysRef = useRef(new Set<string>());
+  const stickRef = useRef({ x: 0, y: 0 });
   const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
   const sendPulseRef = useRef<((pulse: Pulse) => Promise<void>) | null>(null);
   const collectedRef = useRef(new Set<string>());
@@ -558,6 +698,10 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
   const color = useMemo(() => COLORS[Math.floor(Math.random() * COLORS.length)], []);
 
   useEffect(() => { chatsRef.current = chats; }, [chats]);
+  useEffect(() => {
+    const me = playersRef.current.get(selfId);
+    if (me) me.name = name || "PLAYER";
+  }, [name]);
 
   const playTone = useCallback((frequency: number) => {
     if (!sound) return;
@@ -583,17 +727,17 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
     playTone(120);
   }, [game.id, playTone]);
 
-  const setTouchKey = (key: string, pressed: boolean) => {
-    if (pressed) keysRef.current.add(key);
-    else keysRef.current.delete(key);
-  };
+  const setStick = useCallback((x: number, y: number) => { stickRef.current = { x, y }; }, []);
 
   useEffect(() => {
     const now = Date.now();
-    playersRef.current.set(selfId, {
+    const existing = playersRef.current.get(selfId);
+    playersRef.current.clear();
+    playersRef.current.set(selfId, existing ?? {
       id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, crown: game.id === "crown-chase", seen: now,
     });
+    setConnected(1);
 
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, `public-${game.id}`);
     const stateAction = room.makeAction<WirePlayer>("player-state");
@@ -616,9 +760,8 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
       sendStateRef.current = null;
       sendPulseRef.current = null;
       void room.leave();
-      playersRef.current.clear();
     };
-  }, [color, game.id, name]);
+  }, [color, connectionEpoch, game.id]);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -645,11 +788,13 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
       const me = playersRef.current.get(selfId);
       if (!me) { frame = requestAnimationFrame(loop); return; }
       const keys = keysRef.current;
-      const dx = Number(keys.has("d") || keys.has("arrowright")) - Number(keys.has("a") || keys.has("arrowleft"));
-      const dy = Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
-      const length = Math.hypot(dx, dy) || 1;
-      me.vx += (dx / length * 310 - me.vx) * Math.min(dt * 9, 1);
-      me.vy += (dy / length * 310 - me.vy) * Math.min(dt * 9, 1);
+      const keyboardX = Number(keys.has("d") || keys.has("arrowright")) - Number(keys.has("a") || keys.has("arrowleft"));
+      const keyboardY = Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
+      const keyboardLength = Math.hypot(keyboardX, keyboardY) || 1;
+      const dx = keyboardX ? keyboardX / keyboardLength : stickRef.current.x;
+      const dy = keyboardY ? keyboardY / keyboardLength : stickRef.current.y;
+      me.vx += (dx * 310 - me.vx) * Math.min(dt * 9, 1);
+      me.vy += (dy * 310 - me.vy) * Math.min(dt * 9, 1);
       if (!dx) me.vx *= Math.pow(0.01, dt); if (!dy) me.vy *= Math.pow(0.01, dt);
       me.x += me.vx * dt; me.y += me.vy * dt;
 
@@ -728,7 +873,7 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
           ))}
         </aside>
       </section>
-      <MobileController onDirection={setTouchKey} onAction={game.id === "pulse-push" ? triggerPulse : undefined} actionLabel={game.id === "pulse-push" ? "PULSE" : "A"} />
+      <MobileController onMove={setStick} onAction={game.id === "pulse-push" ? triggerPulse : undefined} actionLabel={game.id === "pulse-push" ? "PULSE" : "A"} />
       <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.id === "pulse-push" && <span><kbd>SPACE</kbd> パルス</span>}<p>{game.description}</p></div>
     </main>
   );
