@@ -13,6 +13,20 @@ export const CHAT_LOG_LIMIT = 100;
 const CHAT_BACKDATE_LIMIT_MS = 24 * 60 * 60 * 1000;
 const OWN_CHAT_STORAGE_KEY = "multiplay-own-chat-v1";
 
+function twoDigits(value: number) {
+  return value.toString().padStart(2, "0");
+}
+
+export function formatChatTimestamp(at: number, now = Date.now()) {
+  const date = new Date(at);
+  const today = new Date(now);
+  const time = `${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
+  const sameDay = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate();
+  return sameDay ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`;
+}
+
 // `name` is carried so older builds still render something, but it is a
 // self-declared value and must never be used for display; the log resolves the
 // author's name from presence by peer id instead.

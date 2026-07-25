@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CHAT_LOG_LIMIT, mergeChatEntries, sanitizeChatHistory, sanitizeChatPayload } from "../app/chat.ts";
+import { CHAT_LOG_LIMIT, formatChatTimestamp, mergeChatEntries, sanitizeChatHistory, sanitizeChatPayload } from "../app/chat.ts";
 
 const NOW = 1_000_000_000;
 
@@ -11,6 +11,14 @@ const payload = (overrides = {}) => ({
   at: NOW - 500,
   place: "lobby",
   ...overrides,
+});
+
+test("formatChatTimestamp shows time today and date for older messages", () => {
+  const now = new Date(2026, 6, 25, 18, 30).getTime();
+  const today = new Date(2026, 6, 25, 9, 7).getTime();
+  const older = new Date(2026, 6, 24, 23, 59).getTime();
+  assert.equal(formatChatTimestamp(today, now), "09:07");
+  assert.equal(formatChatTimestamp(older, now), "7/24 23:59");
 });
 
 test("sanitizeChatPayload accepts a well-formed message", () => {

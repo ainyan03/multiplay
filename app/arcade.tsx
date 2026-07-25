@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { joinRoom, selfId } from "trystero";
 import {
   CHAT_TEXT_LIMIT,
+  formatChatTimestamp,
   loadOwnChatHistory,
   mergeChatEntries,
   OWN_CHAT_HISTORY_LIMIT,
@@ -671,7 +672,11 @@ function ChatPanel({ chats, names, place, onSend }: {
       >
         {chats.map((chat) => (
           <div className={`chat-message ${chat.system ? "system" : chat.authorId === selfId ? "own" : "other"}`} key={chat.id}>
-            <p><b>{authorName(chat)}</b><small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small></p>
+            <p>
+              <b>{authorName(chat)}</b>
+              <small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small>
+              <time dateTime={new Date(chat.at).toISOString()}>{formatChatTimestamp(chat.at)}</time>
+            </p>
             <span>{chat.text}</span>
           </div>
         ))}
