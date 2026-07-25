@@ -6,8 +6,9 @@ import {
   loadOwnChatHistory,
   mergeChatEntries,
   OWN_CHAT_HISTORY_LIMIT,
-  sanitizeChatPayload,
+  sanitizeChatHistory,
   saveOwnChatHistory,
+  sanitizeChatPayload,
   type ChatEntry,
   type ChatHistoryRequest,
   type ChatHistoryResponse,
@@ -17,8 +18,9 @@ import {
   GAME_DEFINITIONS as GAMES,
   GAME_HEIGHT as HEIGHT,
   GAME_WIDTH as WIDTH,
-  isPlaceId,
   PLAYER_NAME_LIMIT,
+  PULSE_LIFETIME_MS,
+  sanitizePulse,
   type GameDefinition,
   type GameId,
   type PlaceId,
@@ -26,16 +28,42 @@ import {
   type PulseState,
 } from "./games.ts";
 import { applyLobbyImpulse, isLobbyImpulsePlausible, resolveLobbyCollisions, steerLobbyPlayer } from "./lobbyPhysics.ts";
-import { receiveRemotePlayer, smoothRemotePlayers, type RemoteMotion, type WirePlayer } from "./remotePlayers.ts";
+import {
+  isNewerVersion,
+  parseLobbyImpulse,
+  parsePresence,
+  PROTO_VERSION,
+  STATE_SEND_MS,
+  type LobbyImpulsePayload,
+  type PresencePayload,
+} from "./protocol.ts";
+import { receiveRemotePlayer, smoothRemotePlayers, toWirePlayer, type RemoteMotion, type WirePlayer } from "./remotePlayers.ts";
 
 type Player = PlayerState;
 type Pulse = PulseState;
-type PresencePayload = { name: string; place: PlaceId; at: number };
-type LobbyImpulsePayload = { id: string; targetId: string; vx: number; vy: number; at: number };
 
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
+// Monotonic across room changes and rejoins, so a peer that reconnects is never
+// mistaken for one replaying old updates.
+let stateSeq = 0;
+function nextStateSeq() {
+  stateSeq += 1;
+  return stateSeq;
+}
+
+// Rejoining before the first peer is met corrupts discovery instead of helping
+// it. Trystero keys relay subscriptions by topic without reference counting, so
+// while the initial subscribe is still in flight, a leave/join pair resolves as
+// subscribe, subscribe, unsubscribe -- and the trailing unsubscribe cancels the
+// subscription the new room just made. The tab then announces itself forever
+// while listening to nothing. Once a peer has answered, the subscribe has
+// settled and the same sequence is ordered safely.
+let hasMetPeer = false;
+function notePeerMet() {
+  hasMetPeer = true;
+}
 const LOBBY = {
   id: "lobby" as const,
   icon: "⌂",
@@ -69,30 +97,33 @@ function getAudioContext() {
 
 function useReconnectEpoch() {
   const [epoch, setEpoch] = useState(0);
+  const lastReconnectRef = useRef(0);
+  const requestReconnect = useCallback(() => {
+    if (!hasMetPeer) return;
+    const now = Date.now();
+    if (now - lastReconnectRef.current < 800) return;
+    lastReconnectRef.current = now;
+    setEpoch((current) => current + 1);
+  }, []);
+
   useEffect(() => {
     let wasHidden = document.hidden;
-    let lastReconnect = 0;
-    const reconnect = () => {
-      const now = Date.now();
-      if (now - lastReconnect < 800) return;
-      lastReconnect = now;
-      setEpoch((current) => current + 1);
-    };
     const onVisibility = () => {
       if (document.hidden) { wasHidden = true; return; }
-      if (wasHidden) { wasHidden = false; reconnect(); }
+      if (wasHidden) { wasHidden = false; requestReconnect(); }
     };
-    const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) reconnect(); };
+    const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) requestReconnect(); };
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("pageshow", onPageShow);
-    window.addEventListener("online", reconnect);
+    window.addEventListener("online", requestReconnect);
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pageshow", onPageShow);
-      window.removeEventListener("online", reconnect);
+      window.removeEventListener("online", requestReconnect);
     };
-  }, []);
-  return epoch;
+  }, [requestReconnect]);
+
+  return { epoch, requestReconnect };
 }
 
 function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
@@ -108,6 +139,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     place: "lobby",
     system: true,
   }, ...initialOwnHistory.map((message) => ({ ...message, authorId: selfId }))]);
+  const [outdated, setOutdated] = useState(false);
   const sendPresenceRef = useRef<((payload: PresencePayload) => Promise<void>) | null>(null);
   const sendChatRef = useRef<((payload: ChatPayload) => Promise<void>) | null>(null);
   const identityRef = useRef({ name, place });
@@ -117,6 +149,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
       name: identityRef.current.name || "PLAYER",
       place: identityRef.current.place,
       at: Date.now(),
+      v: PROTO_VERSION,
     };
     setPresence((current) => new Map(current).set(selfId, payload));
     void sendPresenceRef.current?.(payload);
@@ -132,6 +165,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
       name: identityRef.current.name || "PLAYER",
       place: identityRef.current.place,
       at: Date.now(),
+      v: PROTO_VERSION,
     };
     setPresence(new Map([[selfId, localPresence]]));
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "community-hub");
@@ -147,12 +181,10 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     sendChatRef.current = (payload) => chatAction.send(payload);
 
     presenceAction.onMessage = (payload, { peerId }) => {
-      if (!payload || typeof payload.name !== "string" || !isPlaceId(payload.place)) return;
-      setPresence((current) => new Map(current).set(peerId, {
-        name: payload.name.slice(0, PLAYER_NAME_LIMIT),
-        place: payload.place,
-        at: Date.now(),
-      }));
+      const parsed = parsePresence(payload, Date.now());
+      if (!parsed) return;
+      if (isNewerVersion(parsed.v)) setOutdated(true);
+      setPresence((current) => new Map(current).set(peerId, parsed));
     };
     chatAction.onMessage = (payload, { peerId }) => {
       const sanitized = sanitizeChatPayload(payload, Date.now());
@@ -160,16 +192,15 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
       setChats((current) => mergeChatEntries(current, [{ ...sanitized, authorId: peerId }]));
     };
     room.onPeerJoin = (peerId) => {
+      notePeerMet();
       publishPresence();
       void historyAction.request({ version: 1 }, { target: peerId, timeoutMs: 3_000 }).then((response) => {
-        if (!response || !Array.isArray(response.messages)) return;
-        const now = Date.now();
-        const restored = response.messages
-          .slice(-OWN_CHAT_HISTORY_LIMIT)
-          .map((item) => sanitizeChatPayload(item, now))
-          .filter((item): item is ChatPayload => item !== null)
-          .map((message): ChatEntry => ({ ...message, authorId: peerId }));
-        if (restored.length) setChats((current) => mergeChatEntries(current, restored));
+        const messages = sanitizeChatHistory(response, Date.now());
+        if (!messages?.length) return;
+        // The peer that answered is recorded as the author; it only ever serves
+        // its own messages, so it cannot attribute history to anyone else.
+        const restored = messages.map((message): ChatEntry => ({ ...message, authorId: peerId }));
+        setChats((current) => mergeChatEntries(current, restored));
       }).catch(() => undefined);
     };
     room.onPeerLeave = (peerId) => {
@@ -187,7 +218,11 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
       setPresence((current) => new Map([...current].filter(([id, item]) => id === selfId || item.at >= cutoff)));
     }, 5_000);
 
+    const onPageHide = () => { void room.leave(); };
+    window.addEventListener("pagehide", onPageHide);
+
     return () => {
+      window.removeEventListener("pagehide", onPageHide);
       window.clearInterval(presenceTimer);
       window.clearInterval(cleanupTimer);
       sendPresenceRef.current = null;
@@ -218,14 +253,22 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     return result;
   }, [presence]);
 
-  return { chats, counts, sendChat };
+  // Chat renders names from here rather than from the message, so a peer cannot
+  // post under someone else's name.
+  const names = useMemo(() => {
+    const result = new Map<string, string>();
+    for (const [id, item] of presence) if (item.name) result.set(id, item.name);
+    return result;
+  }, [presence]);
+
+  return { chats, counts, names, outdated, sendChat };
 }
 
 export function Arcade() {
   const [gameId, setGameId] = useState<GameId | null>(null);
   const [name, setName] = useState(() => `PLAYER-${Math.floor(100 + Math.random() * 900)}`);
   const [sound, setSound] = useState(true);
-  const connectionEpoch = useReconnectEpoch();
+  const { epoch: connectionEpoch } = useReconnectEpoch();
   const place: PlaceId = gameId ?? "lobby";
   const community = useCommunity(name, place, connectionEpoch);
   const selected = GAMES.find((game) => game.id === gameId);
@@ -255,7 +298,12 @@ export function Arcade() {
       ) : (
         <LobbyScreen name={name} chats={community.chats} counts={community.counts} connectionEpoch={connectionEpoch} onName={setName} onJoin={setGameId} />
       )}
-      <ChatPanel chats={community.chats} place={place} onSend={community.sendChat} />
+      <ChatPanel chats={community.chats} names={community.names} place={place} onSend={community.sendChat} />
+      {community.outdated && (
+        <div className="update-banner" role="status">
+          新しいバージョンが公開されています。ページを再読み込みしてください。
+        </div>
+      )}
     </>
   );
 }
@@ -297,6 +345,12 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   const enterPortal = useCallback(() => {
     if (nearGameRef.current) onJoin(nearGameRef.current);
   }, [onJoin]);
+  const broadcastState = useCallback(() => {
+    const me = playersRef.current.get(selfId);
+    if (!me) return;
+    me.seen = Date.now();
+    void sendStateRef.current?.(toWirePlayer(me, nextStateSeq()));
+  }, []);
 
   useEffect(() => {
     const existing = playersRef.current.get(selfId);
@@ -317,8 +371,9 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     stateAction.onMessage = (state, { peerId }) => {
       receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, Date.now());
     };
-    impulseAction.onMessage = (impulse, { peerId }) => {
-      if (!impulse || typeof impulse.id !== "string" || impulse.targetId !== selfId || receivedImpulseIdsRef.current.has(impulse.id)) return;
+    impulseAction.onMessage = (payload, { peerId }) => {
+      const impulse = parseLobbyImpulse(payload, selfId);
+      if (!impulse || receivedImpulseIdsRef.current.has(impulse.id)) return;
       const me = playersRef.current.get(selfId);
       const source = playersRef.current.get(peerId);
       if (!me || !source || !isLobbyImpulsePlausible(me, source, impulse.vx, impulse.vy, Date.now())) return;
@@ -329,18 +384,32 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       }
       applyLobbyImpulse(me, impulse.vx, impulse.vy);
     };
-    room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
+    room.onPeerJoin = () => {
+      notePeerMet();
+      setConnected(Object.keys(room.getPeers()).length + 1);
+      broadcastState();
+    };
     room.onPeerLeave = (peerId) => {
       playersRef.current.delete(peerId);
       remoteMotionsRef.current.delete(peerId);
       setConnected(Object.keys(room.getPeers()).length + 1);
     };
+
+    // Broadcasting from a timer rather than the animation frame keeps a
+    // backgrounded tab visible to everyone else: browsers throttle rAF to a
+    // standstill, which used to make the player vanish after the ghost timeout.
+    const stateTimer = window.setInterval(broadcastState, STATE_SEND_MS);
+    const onPageHide = () => { void room.leave(); };
+    window.addEventListener("pagehide", onPageHide);
+
     return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.clearInterval(stateTimer);
       sendStateRef.current = null;
       sendImpulseRef.current = null;
       void room.leave();
     };
-  }, [color, connectionEpoch]);
+  }, [broadcastState, color, connectionEpoch]);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -358,7 +427,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
-    let frame = 0; let previous = performance.now(); let lastSend = 0;
+    let frame = 0; let previous = performance.now();
     const loop = (time: number) => {
       const dt = Math.min((time - previous) / 1000, .05); previous = time;
       const now = Date.now();
@@ -386,11 +455,6 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       }
       const closest = LOBBY_PORTALS.find((portal) => Math.hypot(me.x - portal.x, me.y - portal.y) < 76)?.gameId ?? null;
       if (closest !== nearGameRef.current) { nearGameRef.current = closest; setNearGame(closest); }
-      if (time - lastSend > 66) {
-        lastSend = time; me.seen = now;
-        const { seen: _seen, ...wire } = me; void _seen;
-        void sendStateRef.current?.(wire);
-      }
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
         playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
       }
@@ -427,7 +491,12 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   );
 }
 
-function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceId; onSend: (text: string) => void }) {
+function ChatPanel({ chats, names, place, onSend }: {
+  chats: ChatEntry[];
+  names: Map<string, string>;
+  place: PlaceId;
+  onSend: (text: string) => void;
+}) {
   type ChatSize = "collapsed" | "compact" | "expanded";
   const [draft, setDraft] = useState("");
   const [size, setSize] = useState<ChatSize>("compact");
@@ -563,6 +632,11 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
     setUnread(0);
   };
 
+  // Resolved from presence, never from the message, so a peer serving history
+  // cannot make its messages appear under another player's name.
+  const authorName = (chat: ChatEntry) =>
+    chat.system ? chat.name : names.get(chat.authorId) ?? shortId(chat.authorId);
+
   const latest = [...chats].reverse().find((chat) => !chat.system);
 
   return (
@@ -570,7 +644,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
       <header>
         <button className="chat-heading" type="button" onClick={size === "collapsed" ? openChat : undefined} aria-expanded={size !== "collapsed"}>
           <span className="online-dot" /><strong>{inputActive ? "TYPING" : "GLOBAL CHAT"}</strong>
-          {size === "collapsed" && latest && <em><b>{latest.name}</b> {latest.text}</em>}
+          {size === "collapsed" && latest && <em><b>{authorName(latest)}</b> {latest.text}</em>}
           {unread > 0 && <i className="unread-badge">{unread > 99 ? "99+" : unread}</i>}
         </button>
         <div className="chat-tools">
@@ -597,7 +671,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
       >
         {chats.map((chat) => (
           <div className={`chat-message ${chat.system ? "system" : chat.authorId === selfId ? "own" : "other"}`} key={chat.id}>
-            <p><b>{chat.name}</b><small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small></p>
+            <p><b>{authorName(chat)}</b><small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small></p>
             <span>{chat.text}</span>
           </div>
         ))}
@@ -708,7 +782,9 @@ function MobileController({ onMove, onAction, actionLabel }: {
     event.preventDefault();
     if (pointerRef.current !== null) return;
     pointerRef.current = event.pointerId;
-    event.currentTarget.setPointerCapture(event.pointerId);
+    // Synthetic or already released pointers make this throw, which would abort
+    // the handler and leave the stick stuck mid-press.
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* capture is optional */ }
     document.documentElement.classList.add("controller-active");
     document.getSelection()?.removeAllRanges();
     updateStick(event.clientX, event.clientY);
@@ -813,6 +889,12 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
   }, [game.id, playTone]);
 
   const setStick = useCallback((x: number, y: number) => { stickRef.current = { x, y }; }, []);
+  const broadcastState = useCallback(() => {
+    const me = playersRef.current.get(selfId);
+    if (!me) return;
+    me.seen = Date.now();
+    void sendStateRef.current?.(toWirePlayer(me, nextStateSeq()));
+  }, []);
 
   useEffect(() => {
     const now = Date.now();
@@ -833,21 +915,34 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     stateAction.onMessage = (state, { peerId }) => {
       receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, Date.now());
     };
-    pulseAction.onMessage = (pulse) => {
-      if (pulse && typeof pulse.x === "number") pulsesRef.current.push(pulse);
+    pulseAction.onMessage = (payload, { peerId }) => {
+      const pulse = sanitizePulse(payload, peerId, Date.now());
+      if (pulse) pulsesRef.current.push(pulse);
     };
-    room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
+    room.onPeerJoin = () => {
+      notePeerMet();
+      setConnected(Object.keys(room.getPeers()).length + 1);
+      broadcastState();
+    };
     room.onPeerLeave = (peerId) => {
       playersRef.current.delete(peerId);
       remoteMotionsRef.current.delete(peerId);
       setConnected(Object.keys(room.getPeers()).length + 1);
     };
+
+    // See the lobby room for why this is a timer and not the animation frame.
+    const stateTimer = window.setInterval(broadcastState, STATE_SEND_MS);
+    const onPageHide = () => { void room.leave(); };
+    window.addEventListener("pagehide", onPageHide);
+
     return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.clearInterval(stateTimer);
       sendStateRef.current = null;
       sendPulseRef.current = null;
       void room.leave();
     };
-  }, [color, connectionEpoch, game]);
+  }, [broadcastState, color, connectionEpoch, game]);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -866,7 +961,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     if (!canvas) return;
     const context = canvas.getContext("2d");
     if (!context) return;
-    let frame = 0; let previous = performance.now(); let lastSend = 0; let lastBoard = 0;
+    let frame = 0; let previous = performance.now(); let lastBoard = 0;
 
     const loop = (time: number) => {
       const dt = Math.min((time - previous) / 1000, 0.05); previous = time;
@@ -884,7 +979,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       if (!dx) me.vx *= Math.pow(0.01, dt); if (!dy) me.vy *= Math.pow(0.01, dt);
       me.x += me.vx * dt; me.y += me.vy * dt;
 
-      pulsesRef.current = pulsesRef.current.filter((pulse) => now - pulse.born < 750);
+      pulsesRef.current = pulsesRef.current.filter((pulse) => now - pulse.born < PULSE_LIFETIME_MS);
       game.update({
         me,
         players: playersRef.current,
@@ -896,11 +991,6 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
         playTone,
       });
 
-      if (time - lastSend > 66) {
-        lastSend = time; me.seen = now;
-        const { seen: _seen, ...wire } = me; void _seen;
-        void sendStateRef.current?.(wire);
-      }
       smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, selfId, dt, now);
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
         playersRef.current.delete(id); remoteMotionsRef.current.delete(id);

@@ -1,35 +1,67 @@
 import { GAME_HEIGHT, GAME_WIDTH, PLAYER_NAME_LIMIT, type PlayerState } from "./games.ts";
+import { finite, integer, record } from "./validate.ts";
 
-export type WirePlayer = Omit<PlayerState, "seen"> & { seen?: number };
-export type RemoteMotion = { x: number; y: number; vx: number; vy: number; receivedAt: number };
+export type WirePlayer = {
+  name: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  color: string;
+  score: number;
+  crown?: boolean;
+  seq?: number;
+};
 
-const MAX_WIRE_SPEED = 1_000;
-const COLOR_PATTERN = /^#[0-9a-f]{3,8}$/i;
-const FALLBACK_COLOR = "#8fa3bd";
+export type RemoteMotion = { x: number; y: number; vx: number; vy: number; receivedAt: number; seq: number };
 
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
+// Positions leave the field briefly during knockback, so the accepted box is the
+// field plus a margin rather than the field itself.
+const POSITION_MARGIN = 64;
+const MAX_WIRE_SPEED = 2_000;
+const MAX_WIRE_SCORE = 10_000_000;
+const COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 
-function finiteOr(value: unknown, fallback: number) {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
+// A malformed field means the sender is misbehaving, so the whole update is
+// dropped. Repairing it instead would let a peer place itself anywhere by
+// sending values that get clamped back into the field.
 export function sanitizeWirePlayer(value: unknown): WirePlayer | null {
-  if (!value || typeof value !== "object") return null;
-  const item = value as Partial<WirePlayer>;
-  if (typeof item.x !== "number" || !Number.isFinite(item.x)) return null;
-  if (typeof item.y !== "number" || !Number.isFinite(item.y)) return null;
+  const item = record(value);
+  if (!item) return null;
+  if (typeof item.name !== "string" || item.name.length > PLAYER_NAME_LIMIT) return null;
+  if (!finite(item.x, -POSITION_MARGIN, GAME_WIDTH + POSITION_MARGIN)) return null;
+  if (!finite(item.y, -POSITION_MARGIN, GAME_HEIGHT + POSITION_MARGIN)) return null;
+  if (!finite(item.vx, -MAX_WIRE_SPEED, MAX_WIRE_SPEED)) return null;
+  if (!finite(item.vy, -MAX_WIRE_SPEED, MAX_WIRE_SPEED)) return null;
+  if (typeof item.color !== "string" || !COLOR_PATTERN.test(item.color)) return null;
+  if (!finite(item.score, 0, MAX_WIRE_SCORE)) return null;
+  if (item.crown !== undefined && typeof item.crown !== "boolean") return null;
+  // Older builds predate sequence numbers; those updates stay accepted unordered.
+  if (item.seq !== undefined && !integer(item.seq, 0, Number.MAX_SAFE_INTEGER)) return null;
   return {
-    id: typeof item.id === "string" ? item.id.slice(0, 64) : "",
-    name: typeof item.name === "string" ? item.name.slice(0, PLAYER_NAME_LIMIT) : "",
-    x: clamp(item.x, 0, GAME_WIDTH),
-    y: clamp(item.y, 0, GAME_HEIGHT),
-    vx: clamp(finiteOr(item.vx, 0), -MAX_WIRE_SPEED, MAX_WIRE_SPEED),
-    vy: clamp(finiteOr(item.vy, 0), -MAX_WIRE_SPEED, MAX_WIRE_SPEED),
-    color: typeof item.color === "string" && COLOR_PATTERN.test(item.color) ? item.color : FALLBACK_COLOR,
-    score: Math.max(0, finiteOr(item.score, 0)),
-    crown: item.crown === true,
+    name: item.name,
+    x: item.x,
+    y: item.y,
+    vx: item.vx,
+    vy: item.vy,
+    color: item.color,
+    score: item.score,
+    ...(item.crown === undefined ? {} : { crown: item.crown }),
+    ...(item.seq === undefined ? {} : { seq: item.seq }),
+  };
+}
+
+export function toWirePlayer(player: PlayerState, seq: number): WirePlayer {
+  return {
+    name: player.name,
+    x: player.x,
+    y: player.y,
+    vx: player.vx,
+    vy: player.vy,
+    color: player.color,
+    score: player.score,
+    ...(player.crown === undefined ? {} : { crown: player.crown }),
+    seq,
   };
 }
 
@@ -42,6 +74,10 @@ export function receiveRemotePlayer(
 ) {
   const sanitized = sanitizeWirePlayer(state);
   if (!sanitized) return;
+  const previous = motions.get(peerId);
+  // A late packet would otherwise rewind the remote avatar by less than the
+  // teleport threshold, which reads as stutter rather than an obvious fault.
+  if (sanitized.seq !== undefined && previous && sanitized.seq <= previous.seq) return;
   const existing = players.get(peerId);
   if (existing) {
     existing.name = sanitized.name;
@@ -50,9 +86,16 @@ export function receiveRemotePlayer(
     existing.crown = sanitized.crown;
     existing.seen = receivedAt;
   } else {
-    players.set(peerId, { ...sanitized, id: peerId, seen: receivedAt });
+    players.set(peerId, { ...sanitized, id: peerId, crown: sanitized.crown, seen: receivedAt });
   }
-  motions.set(peerId, { x: sanitized.x, y: sanitized.y, vx: sanitized.vx, vy: sanitized.vy, receivedAt });
+  motions.set(peerId, {
+    x: sanitized.x,
+    y: sanitized.y,
+    vx: sanitized.vx,
+    vy: sanitized.vy,
+    receivedAt,
+    seq: sanitized.seq ?? (previous ? previous.seq : 0),
+  });
 }
 
 export function smoothRemotePlayers(

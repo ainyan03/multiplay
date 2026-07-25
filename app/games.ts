@@ -1,3 +1,5 @@
+import { boundedString, finite, record } from "./validate.ts";
+
 export type GameId = "gem-sprint" | "crown-chase" | "pulse-push";
 export type PlaceId = "lobby" | GameId;
 
@@ -195,4 +197,17 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
 
 export function isPlaceId(value: unknown): value is PlaceId {
   return value === "lobby" || GAME_DEFINITIONS.some((game) => game.id === value);
+}
+
+export const PULSE_LIFETIME_MS = 750;
+
+// `owner` decides whose pulse skips its own hit test, so it is pinned to the
+// peer the message actually arrived from rather than taken from the payload.
+export function sanitizePulse(value: unknown, peerId: string, now: number): PulseState | null {
+  const item = record(value);
+  if (!item) return null;
+  if (!boundedString(item.id, 160)) return null;
+  if (!finite(item.x, -64, GAME_WIDTH + 64) || !finite(item.y, -64, GAME_HEIGHT + 64)) return null;
+  if (!finite(item.born, now - PULSE_LIFETIME_MS, now + PULSE_LIFETIME_MS)) return null;
+  return { id: item.id, x: item.x, y: item.y, born: item.born, owner: peerId };
 }
