@@ -1,4 +1,7 @@
 export type GameId = "gem-sprint" | "crown-chase" | "pulse-push";
+export type PlaceId = "lobby" | GameId;
+
+export const PLAYER_NAME_LIMIT = 14;
 
 export type PlayerState = {
   id: string;
@@ -113,6 +116,8 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
     actionLabel: "A",
     update: ({ me, collected, now, playTone }) => {
       keepInsideField(me);
+      const phasePrefix = `${Math.floor(now / 9000)}:`;
+      for (const id of collected) if (!id.startsWith(phasePrefix)) collected.delete(id);
       for (const gem of gems(now)) {
         if (!collected.has(gem.id) && Math.hypot(me.x - gem.x, me.y - gem.y) < 28) {
           collected.add(gem.id);
@@ -188,6 +193,6 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
   },
 ];
 
-export function getGameDefinition(gameId: GameId) {
-  return GAME_DEFINITIONS.find((game) => game.id === gameId)!;
+export function isPlaceId(value: unknown): value is PlaceId {
+  return value === "lobby" || GAME_DEFINITIONS.some((game) => game.id === value);
 }

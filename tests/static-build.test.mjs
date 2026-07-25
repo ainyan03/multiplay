@@ -4,9 +4,10 @@ import test from "node:test";
 
 test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   const html = await readFile(new URL("../dist/index.html", import.meta.url), "utf8");
-  const arcadeSource = await readFile(new URL("../app/arcade.tsx", import.meta.url), "utf8");
+  const chatSource = await readFile(new URL("../app/chat.ts", import.meta.url), "utf8");
   const gameDefinitions = await readFile(new URL("../app/games.ts", import.meta.url), "utf8");
   const lobbyPhysics = await readFile(new URL("../app/lobbyPhysics.ts", import.meta.url), "utf8");
+  const remotePlayers = await readFile(new URL("../app/remotePlayers.ts", import.meta.url), "utf8");
   const assets = await readdir(new URL("../dist/assets/", import.meta.url));
   const scripts = await Promise.all(
     assets.filter((name) => name.endsWith(".js")).map((name) => readFile(new URL(`../dist/assets/${name}`, import.meta.url), "utf8")),
@@ -22,8 +23,9 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.ok(scripts.some((source) => source.includes("chat-v1")));
   assert.ok(scripts.some((source) => source.includes("chat-history-v1")));
   assert.ok(scripts.some((source) => source.includes("multiplay-own-chat-v1")));
-  assert.match(arcadeSource, /OWN_CHAT_HISTORY_LIMIT = 40/);
-  assert.match(arcadeSource, /CHAT_LOG_LIMIT = 100/);
+  assert.match(chatSource, /OWN_CHAT_HISTORY_LIMIT = 40/);
+  assert.match(chatSource, /CHAT_LOG_LIMIT = 100/);
+  assert.match(remotePlayers, /sanitizeWirePlayer/);
   assert.ok(scripts.some((source) => source.includes("enterKeyHint")));
   assert.ok(scripts.some((source) => source.includes("mobile-controller")));
   assert.ok(scripts.some((source) => source.includes("analog-stick")));
