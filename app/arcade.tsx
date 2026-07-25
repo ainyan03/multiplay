@@ -1,7 +1,8 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { joinRoom, selfId, type Room } from "trystero";
+import { FormEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import { joinRoom, selfId } from "trystero";
 
 type GameId = "gem-sprint" | "crown-chase" | "pulse-push";
 type PlaceId = "lobby" | GameId;
@@ -28,6 +29,11 @@ const HEIGHT = 540;
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
+const LOBBY_PORTALS: Array<{ gameId: GameId; x: number; y: number; color: string }> = [
+  { gameId: "gem-sprint", x: 180, y: 145, color: "#f9e547" },
+  { gameId: "crown-chase", x: 780, y: 145, color: "#ff6082" },
+  { gameId: "pulse-push", x: 480, y: 430, color: "#5fe0c0" },
+];
 
 const LOBBY = {
   id: "lobby" as const,
@@ -241,63 +247,138 @@ export function Arcade() {
           onLeave={() => setGameId(null)}
         />
       ) : (
-        <LobbyScreen name={name} counts={community.counts} onName={setName} onJoin={setGameId} />
+        <LobbyScreen name={name} chats={community.chats} counts={community.counts} onName={setName} onJoin={setGameId} />
       )}
       <ChatPanel chats={community.chats} place={place} onSend={community.sendChat} />
     </>
   );
 }
 
-function LobbyScreen({ name, counts, onName, onJoin }: {
+function LobbyScreen({ name, chats, counts, onName, onJoin }: {
   name: string;
+  chats: ChatEntry[];
   counts: Record<PlaceId, number>;
   onName: (name: string) => void;
   onJoin: (id: GameId) => void;
 }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const playersRef = useRef<Map<string, Player>>(new Map());
+  const keysRef = useRef(new Set<string>());
+  const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
+  const chatsRef = useRef(chats);
+  const countsRef = useRef(counts);
+  const nearGameRef = useRef<GameId | null>(null);
+  const [nearGame, setNearGame] = useState<GameId | null>(null);
+  const [connected, setConnected] = useState(1);
+  const color = useMemo(() => COLORS[Math.floor(Math.random() * COLORS.length)], []);
+
+  useEffect(() => { chatsRef.current = chats; }, [chats]);
+  useEffect(() => { countsRef.current = counts; }, [counts]);
+  useEffect(() => {
+    const me = playersRef.current.get(selfId);
+    if (me) me.name = name || "PLAYER";
+  }, [name]);
+
+  const setTouchKey = useCallback((key: string, pressed: boolean) => {
+    if (pressed) keysRef.current.add(key);
+    else keysRef.current.delete(key);
+  }, []);
+  const enterPortal = useCallback(() => {
+    if (nearGameRef.current) onJoin(nearGameRef.current);
+  }, [onJoin]);
+
+  useEffect(() => {
+    playersRef.current.set(selfId, {
+      id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
+      vx: 0, vy: 0, color, score: 0, seen: Date.now(),
+    });
+    const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "public-lobby");
+    const stateAction = room.makeAction<WirePlayer>("player-state");
+    sendStateRef.current = (state) => stateAction.send(state);
+    stateAction.onMessage = (state, { peerId }) => {
+      if (!state || typeof state.x !== "number" || typeof state.y !== "number") return;
+      playersRef.current.set(peerId, { ...state, id: peerId, seen: Date.now() });
+    };
+    room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
+    room.onPeerLeave = (peerId) => {
+      playersRef.current.delete(peerId);
+      setConnected(Object.keys(room.getPeers()).length + 1);
+    };
+    return () => {
+      sendStateRef.current = null;
+      void room.leave();
+      playersRef.current.clear();
+    };
+  }, [color]);
+
+  useEffect(() => {
+    const down = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      keysRef.current.add(event.key.toLowerCase());
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(event.key)) event.preventDefault();
+      if (event.key === " ") enterPortal();
+    };
+    const up = (event: KeyboardEvent) => keysRef.current.delete(event.key.toLowerCase());
+    window.addEventListener("keydown", down); window.addEventListener("keyup", up);
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+  }, [enterPortal]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    let frame = 0; let previous = performance.now(); let lastSend = 0;
+    const loop = (time: number) => {
+      const dt = Math.min((time - previous) / 1000, .05); previous = time;
+      const now = Date.now();
+      const me = playersRef.current.get(selfId);
+      if (!me) { frame = requestAnimationFrame(loop); return; }
+      const keys = keysRef.current;
+      const dx = Number(keys.has("d") || keys.has("arrowright")) - Number(keys.has("a") || keys.has("arrowleft"));
+      const dy = Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
+      const length = Math.hypot(dx, dy) || 1;
+      me.vx += (dx / length * 285 - me.vx) * Math.min(dt * 9, 1);
+      me.vy += (dy / length * 285 - me.vy) * Math.min(dt * 9, 1);
+      if (!dx) me.vx *= Math.pow(.01, dt); if (!dy) me.vy *= Math.pow(.01, dt);
+      me.x = Math.max(25, Math.min(WIDTH - 25, me.x + me.vx * dt));
+      me.y = Math.max(28, Math.min(HEIGHT - 28, me.y + me.vy * dt));
+      const closest = LOBBY_PORTALS.find((portal) => Math.hypot(me.x - portal.x, me.y - portal.y) < 76)?.gameId ?? null;
+      if (closest !== nearGameRef.current) { nearGameRef.current = closest; setNearGame(closest); }
+      if (time - lastSend > 66) {
+        lastSend = time; me.seen = now;
+        const { seen: _seen, ...wire } = me; void _seen;
+        void sendStateRef.current?.(wire);
+      }
+      for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) playersRef.current.delete(id);
+      drawLobby(context, [...playersRef.current.values()], chatsRef.current, countsRef.current, closest, now);
+      frame = requestAnimationFrame(loop);
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  const nearby = GAMES.find((game) => game.id === nearGame);
   return (
-    <main className="lobby-shell has-chat">
-      <header className="topbar">
+    <main className="play-shell lobby-world-shell has-chat">
+      <header className="play-header lobby-world-header">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
-          <div><strong>MULTIPLAY</strong><small>ONLINE ARCADE</small></div>
+          <div><strong>MULTIPLAY</strong><small>LOBBY MAP</small></div>
         </div>
-        <div className="online-pill"><span /> {Object.values(counts).reduce((sum, count) => sum + count, 0)} ONLINE</div>
+        <label className="lobby-name" htmlFor="player-name"><span>PLAYER</span><input id="player-name" maxLength={14} value={name} onChange={(event) => onName(event.target.value.toUpperCase())} /></label>
+        <div className="play-status"><span className="online-dot" /> {connected} IN PLAZA</div>
       </header>
-
-      <section className="hero">
-        <p className="eyebrow">DROP IN. PLAY TOGETHER.</p>
-        <h1>あつまれば、<br /><em>すぐゲーム。</em></h1>
-        <p className="lead">登録も待ち時間もなし。好きなゲームを選んだら、<br />世界のどこかのプレイヤーとその場でつながります。</p>
-      </section>
-
-      <section className="player-name" aria-label="プレイヤー設定">
-        <label htmlFor="player-name">YOUR NAME</label>
-        <input id="player-name" maxLength={14} value={name} onChange={(event) => onName(event.target.value.toUpperCase())} />
-        <span>名前はこの端末だけに保存され、ゲーム中はキャラクターの頭上に表示されます</span>
-      </section>
-
-      <section className="game-section">
-        <div className="section-title"><h2>CHOOSE A PLACE</h2><span>LOBBY + 3 GAMES</span></div>
-        <div className="game-grid">
-          {PLACES.map((item, index) => (
-            <article className={`game-card ${item.accent} ${item.id === "lobby" ? "is-current" : ""}`} key={item.id}>
-              <div className="card-topline"><span>0{index + 1}</span><b className="live-count"><i /> {counts[item.id]} ONLINE</b></div>
-              <div className="game-icon" aria-hidden="true">{item.icon}</div>
-              <p>{item.subtitle}</p>
-              <h3>{item.title}</h3>
-              <div className="pixel-rule" />
-              <p className="description">{item.description}</p>
-              {item.id === "lobby" ? (
-                <button className="current-button" disabled>いまロビーにいます <span>●</span></button>
-              ) : (
-                <button onClick={() => onJoin(item.id)}>このゲームに参加 <span>→</span></button>
-              )}
-            </article>
-          ))}
+      <nav className="occupancy-strip" aria-label="各ゲームの参加人数">
+        {PLACES.map((item) => <span className={item.id === "lobby" ? "active" : ""} key={item.id}><b>{item.shortTitle}</b> {counts[item.id]}</span>)}
+      </nav>
+      <section className="lobby-world-stage">
+        <canvas ref={canvasRef} width={WIDTH} height={HEIGHT} aria-label="LOBBY MAP ロビー広場" />
+        <div className={`portal-prompt ${nearby ? "visible" : ""}`}>
+          {nearby ? <><b>{nearby.icon} {nearby.title}</b><span><kbd>SPACE</kbd> または <kbd>A</kbd> で入る</span></> : <span>入口まで歩いてゲームを選ぼう</span>}
         </div>
       </section>
-
-      <footer><span>WEBRTC / SERVERLESS</span><p>ロビーもゲームも、いつでも参加・退出できます。</p><span>V0.2 COMMUNITY</span></footer>
+      <MobileController onDirection={setTouchKey} onAction={nearGame ? enterPortal : undefined} actionLabel="A" />
+      <div className="controls-bar lobby-controls"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span><span><kbd>SPACE</kbd> 入口に入る</span><p>マップ上の入口に近づくと、参加中の人数とゲーム名を確認できます。</p></div>
     </main>
   );
 }
@@ -335,6 +416,18 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
     const log = logRef.current;
     if (log && atBottomRef.current) log.scrollTop = log.scrollHeight;
   }, [size]);
+
+  useEffect(() => {
+    const focusChat = () => {
+      flushSync(() => setSize("compact"));
+      inputRef.current?.focus({ preventScroll: true });
+    };
+    window.addEventListener("multiplay:chat-focus", focusChat);
+    return () => {
+      window.removeEventListener("multiplay:chat-focus", focusChat);
+      document.documentElement.classList.remove("chat-input-focused");
+    };
+  }, []);
 
   const sendDraft = () => {
     if (!draft.trim()) return;
@@ -379,7 +472,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
       </header>
       <div className="chat-log" ref={logRef} onScroll={handleScroll} aria-live="polite">
         {chats.map((chat) => (
-          <div className={`chat-message ${chat.system ? "system" : ""}`} key={chat.id}>
+          <div className={`chat-message ${chat.system ? "system" : chat.authorId === selfId ? "own" : "other"}`} key={chat.id}>
             <p><b>{chat.name}</b><small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small></p>
             <span>{chat.text}</span>
           </div>
@@ -397,9 +490,11 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onFocus={() => {
+            document.documentElement.classList.add("chat-input-focused");
             if (size === "collapsed") setSize("compact");
             requestAnimationFrame(() => inputRef.current?.scrollIntoView({ block: "nearest" }));
           }}
+          onBlur={() => document.documentElement.classList.remove("chat-input-focused")}
           onKeyDown={(event) => {
             event.stopPropagation();
             if (event.key === "Enter" && !event.shiftKey) {
@@ -411,6 +506,33 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
         <button aria-label="送信" type="submit">SEND</button>
       </form>
     </aside>
+  );
+}
+
+function MobileController({ onDirection, onAction, actionLabel }: {
+  onDirection: (key: string, pressed: boolean) => void;
+  onAction?: () => void;
+  actionLabel: string;
+}) {
+  const directionProps = (key: string) => ({
+    onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => { event.currentTarget.setPointerCapture(event.pointerId); onDirection(key, true); },
+    onPointerUp: () => onDirection(key, false),
+    onPointerCancel: () => onDirection(key, false),
+    onLostPointerCapture: () => onDirection(key, false),
+  });
+  return (
+    <div className="mobile-controller" aria-label="スマートフォン用仮想コントローラ">
+      <div className="controller-dpad">
+        <button className="up" aria-label="上へ移動" {...directionProps("arrowup")}>▲</button>
+        <button className="left" aria-label="左へ移動" {...directionProps("arrowleft")}>◀</button>
+        <button className="down" aria-label="下へ移動" {...directionProps("arrowdown")}>▼</button>
+        <button className="right" aria-label="右へ移動" {...directionProps("arrowright")}>▶</button>
+      </div>
+      <div className="controller-actions">
+        <button className="chat-action" type="button" onPointerDown={() => window.dispatchEvent(new Event("multiplay:chat-focus"))}>CHAT</button>
+        <button className="primary-action" type="button" disabled={!onAction} onPointerDown={onAction}>{actionLabel}</button>
+      </div>
+    </div>
   );
 }
 
@@ -606,15 +728,7 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
           ))}
         </aside>
       </section>
-      <div className="mobile-controls" aria-label="タッチ操作">
-        <div className="touch-dpad">
-          <button className="up" aria-label="上へ移動" onPointerDown={() => setTouchKey("arrowup", true)} onPointerUp={() => setTouchKey("arrowup", false)} onPointerCancel={() => setTouchKey("arrowup", false)} onPointerLeave={() => setTouchKey("arrowup", false)}>▲</button>
-          <button className="left" aria-label="左へ移動" onPointerDown={() => setTouchKey("arrowleft", true)} onPointerUp={() => setTouchKey("arrowleft", false)} onPointerCancel={() => setTouchKey("arrowleft", false)} onPointerLeave={() => setTouchKey("arrowleft", false)}>◀</button>
-          <button className="down" aria-label="下へ移動" onPointerDown={() => setTouchKey("arrowdown", true)} onPointerUp={() => setTouchKey("arrowdown", false)} onPointerCancel={() => setTouchKey("arrowdown", false)} onPointerLeave={() => setTouchKey("arrowdown", false)}>▼</button>
-          <button className="right" aria-label="右へ移動" onPointerDown={() => setTouchKey("arrowright", true)} onPointerUp={() => setTouchKey("arrowright", false)} onPointerCancel={() => setTouchKey("arrowright", false)} onPointerLeave={() => setTouchKey("arrowright", false)}>▶</button>
-        </div>
-        {game.id === "pulse-push" && <button className="touch-action" onPointerDown={triggerPulse}>PULSE</button>}
-      </div>
+      <MobileController onDirection={setTouchKey} onAction={game.id === "pulse-push" ? triggerPulse : undefined} actionLabel={game.id === "pulse-push" ? "PULSE" : "A"} />
       <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.id === "pulse-push" && <span><kbd>SPACE</kbd> パルス</span>}<p>{game.description}</p></div>
     </main>
   );
@@ -647,32 +761,73 @@ function drawGame(
     context.strokeStyle = `rgba(255,107,138,${Math.max(0, 1 - (now - pulse.born) / 750)})`; context.lineWidth = 10; context.stroke();
   }
 
-  const recentChats = new Map<string, ChatEntry>();
-  for (const chat of chats) if (!chat.system && now - chat.at < CHAT_VISIBLE_MS) recentChats.set(chat.authorId, chat);
+  const recentChats = recentChatMap(chats, now);
+  for (const player of players) drawAvatar(context, player, recentChats.get(player.id));
+}
 
-  for (const player of players) {
-    context.save(); context.translate(player.x, player.y);
-    if (player.crown) { context.fillStyle = "#f9e547"; context.font = "bold 25px monospace"; context.textAlign = "center"; context.fillText("♛", 0, -50); }
-    context.shadowBlur = 16; context.shadowColor = player.color; context.fillStyle = player.color;
-    context.beginPath(); context.arc(0, 0, 16, 0, Math.PI * 2); context.fill();
-    context.shadowBlur = 0; context.fillStyle = "#09111d"; context.fillRect(-5, -5, 4, 5); context.fillRect(3, -5, 4, 5);
+function drawLobby(
+  context: CanvasRenderingContext2D,
+  players: Player[],
+  chats: ChatEntry[],
+  counts: Record<PlaceId, number>,
+  nearGame: GameId | null,
+  now: number,
+) {
+  context.clearRect(0, 0, WIDTH, HEIGHT);
+  context.fillStyle = "#0b1727"; context.fillRect(0, 0, WIDTH, HEIGHT);
+  context.strokeStyle = "rgba(108,156,255,.1)"; context.lineWidth = 1;
+  for (let x = 0; x <= WIDTH; x += 32) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, HEIGHT); context.stroke(); }
+  for (let y = 0; y <= HEIGHT; y += 32) { context.beginPath(); context.moveTo(0, y); context.lineTo(WIDTH, y); context.stroke(); }
+  context.fillStyle = "#111f32"; context.fillRect(80, 70, WIDTH - 160, HEIGHT - 140);
+  context.strokeStyle = "#263c58"; context.lineWidth = 4; context.strokeRect(80, 70, WIDTH - 160, HEIGHT - 140);
+  context.fillStyle = "rgba(108,156,255,.09)";
+  context.beginPath(); context.arc(WIDTH / 2, HEIGHT / 2, 112, 0, Math.PI * 2); context.fill();
+  context.strokeStyle = "rgba(108,156,255,.28)"; context.lineWidth = 3; context.stroke();
+  context.textAlign = "center";
+  context.font = "900 17px monospace"; context.fillStyle = "#6c9cff"; context.fillText("MULTIPLAY PLAZA", WIDTH / 2, HEIGHT / 2 - 8);
+  context.font = "700 10px monospace"; context.fillStyle = "#62758f"; context.fillText("WALK TO A GAME GATE", WIDTH / 2, HEIGHT / 2 + 12);
 
-    context.font = "bold 12px monospace"; context.textAlign = "center";
-    const displayName = player.name || shortId(player.id);
-    const nameWidth = context.measureText(displayName).width + 12;
-    context.fillStyle = "rgba(7,16,29,.84)"; context.fillRect(-nameWidth / 2, -38, nameWidth, 17);
-    context.fillStyle = "white"; context.fillText(displayName, 0, -25);
-
-    const chat = recentChats.get(player.id);
-    if (chat) {
-      const text = chat.text.length > 38 ? `${chat.text.slice(0, 38)}…` : chat.text;
-      const bubbleY = player.crown ? -86 : -62;
-      context.font = "bold 12px sans-serif";
-      const bubbleWidth = Math.min(260, Math.max(74, context.measureText(text).width + 22));
-      context.fillStyle = "#edf0e8"; context.fillRect(-bubbleWidth / 2, bubbleY - 18, bubbleWidth, 27);
-      context.fillStyle = "#07101d"; context.fillText(text, 0, bubbleY);
-      context.beginPath(); context.moveTo(-6, bubbleY + 9); context.lineTo(6, bubbleY + 9); context.lineTo(0, bubbleY + 17); context.fill();
-    }
+  for (const portal of LOBBY_PORTALS) {
+    const game = GAMES.find((item) => item.id === portal.gameId)!;
+    const active = nearGame === portal.gameId;
+    context.save(); context.translate(portal.x, portal.y);
+    context.shadowBlur = active ? 30 : 15; context.shadowColor = portal.color;
+    context.fillStyle = active ? portal.color : "#172a40"; context.fillRect(-82, -48, 164, 96);
+    context.shadowBlur = 0; context.strokeStyle = portal.color; context.lineWidth = active ? 5 : 3; context.strokeRect(-82, -48, 164, 96);
+    context.fillStyle = active ? "#07101d" : portal.color; context.font = "900 28px monospace"; context.fillText(game.icon, 0, -10);
+    context.font = "900 13px monospace"; context.fillText(game.title, 0, 17);
+    context.font = "800 10px monospace"; context.fillText(`${counts[game.id]} PLAYING`, 0, 35);
     context.restore();
   }
+  const recentChats = recentChatMap(chats, now);
+  for (const player of players) drawAvatar(context, player, recentChats.get(player.id));
+}
+
+function recentChatMap(chats: ChatEntry[], now: number) {
+  const recent = new Map<string, ChatEntry>();
+  for (const chat of chats) if (!chat.system && now - chat.at < CHAT_VISIBLE_MS) recent.set(chat.authorId, chat);
+  return recent;
+}
+
+function drawAvatar(context: CanvasRenderingContext2D, player: Player, chat?: ChatEntry) {
+  context.save(); context.translate(player.x, player.y);
+  if (player.crown) { context.fillStyle = "#f9e547"; context.font = "bold 25px monospace"; context.textAlign = "center"; context.fillText("♛", 0, -50); }
+  context.shadowBlur = 16; context.shadowColor = player.color; context.fillStyle = player.color;
+  context.beginPath(); context.arc(0, 0, 16, 0, Math.PI * 2); context.fill();
+  context.shadowBlur = 0; context.fillStyle = "#09111d"; context.fillRect(-5, -5, 4, 5); context.fillRect(3, -5, 4, 5);
+  context.font = "bold 12px monospace"; context.textAlign = "center";
+  const displayName = player.name || shortId(player.id);
+  const nameWidth = context.measureText(displayName).width + 12;
+  context.fillStyle = "rgba(7,16,29,.84)"; context.fillRect(-nameWidth / 2, -38, nameWidth, 17);
+  context.fillStyle = "white"; context.fillText(displayName, 0, -25);
+  if (chat) {
+    const text = chat.text.length > 38 ? `${chat.text.slice(0, 38)}…` : chat.text;
+    const bubbleY = player.crown ? -86 : -62;
+    context.font = "bold 12px sans-serif";
+    const bubbleWidth = Math.min(260, Math.max(74, context.measureText(text).width + 22));
+    context.fillStyle = "#edf0e8"; context.fillRect(-bubbleWidth / 2, bubbleY - 18, bubbleWidth, 27);
+    context.fillStyle = "#07101d"; context.fillText(text, 0, bubbleY);
+    context.beginPath(); context.moveTo(-6, bubbleY + 9); context.lineTo(6, bubbleY + 9); context.lineTo(0, bubbleY + 17); context.fill();
+  }
+  context.restore();
 }
