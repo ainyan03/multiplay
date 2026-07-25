@@ -12,7 +12,7 @@ import {
   type PlayerState,
   type PulseState,
 } from "./games";
-import { resolveLobbyCollisions } from "./lobbyPhysics";
+import { applyLobbyImpulse, resolveLobbyCollisions } from "./lobbyPhysics";
 
 type PlaceId = "lobby" | GameId;
 type Player = PlayerState;
@@ -22,6 +22,7 @@ type Pulse = PulseState;
 type PresencePayload = { name: string; place: PlaceId; at: number };
 type ChatPayload = { id: string; name: string; text: string; at: number; place: PlaceId };
 type ChatEntry = ChatPayload & { authorId: string; system?: boolean };
+type LobbyImpulsePayload = { id: string; targetId: string; vx: number; vy: number; at: number };
 
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
@@ -288,6 +289,9 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   const keysRef = useRef(new Set<string>());
   const stickRef = useRef({ x: 0, y: 0 });
   const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
+  const sendImpulseRef = useRef<((impulse: LobbyImpulsePayload) => Promise<void>) | null>(null);
+  const collisionTimesRef = useRef(new Map<string, number>());
+  const receivedImpulseIdsRef = useRef(new Set<string>());
   const chatsRef = useRef(chats);
   const countsRef = useRef(counts);
   const nearGameRef = useRef<GameId | null>(null);
@@ -311,6 +315,8 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     const existing = playersRef.current.get(selfId);
     playersRef.current.clear();
     remoteMotionsRef.current.clear();
+    collisionTimesRef.current.clear();
+    receivedImpulseIdsRef.current.clear();
     playersRef.current.set(selfId, existing ?? {
       id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, seen: Date.now(),
@@ -318,9 +324,23 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     setConnected(1);
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "public-lobby");
     const stateAction = room.makeAction<WirePlayer>("player-state");
+    const impulseAction = room.makeAction<LobbyImpulsePayload>("collision-impulse-v1");
     sendStateRef.current = (state) => stateAction.send(state);
+    sendImpulseRef.current = (impulse) => impulseAction.send(impulse);
     stateAction.onMessage = (state, { peerId }) => {
       receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId);
+    };
+    impulseAction.onMessage = (impulse) => {
+      if (!impulse || impulse.targetId !== selfId || receivedImpulseIdsRef.current.has(impulse.id)) return;
+      if (!Number.isFinite(impulse.vx) || !Number.isFinite(impulse.vy) || Math.abs(Date.now() - impulse.at) > 2_000) return;
+      if (Math.hypot(impulse.vx, impulse.vy) > 430) return;
+      receivedImpulseIdsRef.current.add(impulse.id);
+      if (receivedImpulseIdsRef.current.size > 128) {
+        const oldest = receivedImpulseIdsRef.current.values().next().value;
+        if (oldest) receivedImpulseIdsRef.current.delete(oldest);
+      }
+      const me = playersRef.current.get(selfId);
+      if (me) applyLobbyImpulse(me, impulse.vx, impulse.vy);
     };
     room.onPeerJoin = () => setConnected(Object.keys(room.getPeers()).length + 1);
     room.onPeerLeave = (peerId) => {
@@ -330,6 +350,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     };
     return () => {
       sendStateRef.current = null;
+      sendImpulseRef.current = null;
       void room.leave();
     };
   }, [color, connectionEpoch]);
@@ -368,7 +389,16 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       me.x += me.vx * dt;
       me.y += me.vy * dt;
       smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
-      resolveLobbyCollisions(me, playersRef.current, now);
+      const collisionImpulses = resolveLobbyCollisions(me, playersRef.current, now, collisionTimesRef.current);
+      for (const impulse of collisionImpulses) {
+        void sendImpulseRef.current?.({
+          id: `${selfId}:${impulse.targetId}:${now}`,
+          targetId: impulse.targetId,
+          vx: impulse.vx,
+          vy: impulse.vy,
+          at: now,
+        });
+      }
       const closest = LOBBY_PORTALS.find((portal) => Math.hypot(me.x - portal.x, me.y - portal.y) < 76)?.gameId ?? null;
       if (closest !== nearGameRef.current) { nearGameRef.current = closest; setNearGame(closest); }
       if (time - lastSend > 66) {
