@@ -563,6 +563,11 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
     };
   }, [updateKeyboardState]);
 
+  useEffect(() => {
+    document.documentElement.classList.toggle("chat-focus-active", inputActive);
+    return () => document.documentElement.classList.remove("chat-focus-active");
+  }, [inputActive]);
+
   const sendDraft = () => {
     if (!draft.trim()) return;
     onSend(draft);
