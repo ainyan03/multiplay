@@ -186,7 +186,12 @@ export function arenaAt(bombs: BombEvent[], now: number, seed = ARENA_SEED, rang
   const softBlocks = new Set<number>();
   for (const key of original) {
     const broken = brokenAt.get(key);
-    if (broken === undefined || now >= broken + REGROW_MS) softBlocks.add(key);
+    // The walk above runs every bomb, including ones whose fuse has not burned
+    // down yet, so a break can be scheduled ahead of `now`. Until that moment
+    // arrives the block is still standing -- otherwise it would vanish as soon
+    // as the bomb was placed.
+    const standingNow = broken === undefined || broken > now || now >= broken + REGROW_MS;
+    if (standingNow) softBlocks.add(key);
   }
 
   const blasts = new Map<number, BlastCell>();
