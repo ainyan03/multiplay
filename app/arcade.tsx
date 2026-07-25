@@ -3,30 +3,25 @@
 import { FormEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { joinRoom, selfId } from "trystero";
+import {
+  GAME_DEFINITIONS as GAMES,
+  GAME_HEIGHT as HEIGHT,
+  GAME_WIDTH as WIDTH,
+  type GameDefinition,
+  type GameId,
+  type PlayerState,
+  type PulseState,
+} from "./games";
 
-type GameId = "gem-sprint" | "crown-chase" | "pulse-push";
 type PlaceId = "lobby" | GameId;
-type Player = {
-  id: string;
-  name: string;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  color: string;
-  score: number;
-  crown?: boolean;
-  seen: number;
-};
+type Player = PlayerState;
 type WirePlayer = Omit<Player, "seen"> & { seen?: number };
 type RemoteMotion = { x: number; y: number; vx: number; vy: number; receivedAt: number };
-type Pulse = { id: string; x: number; y: number; born: number; owner: string };
+type Pulse = PulseState;
 type PresencePayload = { name: string; place: PlaceId; at: number };
 type ChatPayload = { id: string; name: string; text: string; at: number; place: PlaceId };
 type ChatEntry = ChatPayload & { authorId: string; system?: boolean };
 
-const WIDTH = 960;
-const HEIGHT = 540;
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
@@ -47,48 +42,6 @@ const LOBBY = {
   accent: "blue",
 };
 
-const GAMES: Array<{
-  id: GameId;
-  icon: string;
-  title: string;
-  shortTitle: string;
-  subtitle: string;
-  description: string;
-  players: string;
-  accent: string;
-}> = [
-  {
-    id: "gem-sprint",
-    icon: "◆",
-    title: "GEM SPRINT",
-    shortTitle: "GEMS",
-    subtitle: "みんなで宝石ダッシュ",
-    description: "フィールドを駆け回って光る宝石を集めよう。60秒でいちばん集めた人の勝ち。",
-    players: "2–16人",
-    accent: "yellow",
-  },
-  {
-    id: "crown-chase",
-    icon: "♛",
-    title: "CROWN CHASE",
-    shortTitle: "CROWN",
-    subtitle: "王冠おにごっこ",
-    description: "王冠を持つ相手にタッチ！ 持っている時間だけ得点が増える、逆転だらけのおにごっこ。",
-    players: "2–12人",
-    accent: "pink",
-  },
-  {
-    id: "pulse-push",
-    icon: "◎",
-    title: "PULSE PUSH",
-    shortTitle: "PULSE",
-    subtitle: "はじき出しバトル",
-    description: "パルスでライバルを押し出せ。落ちてもすぐ復帰できる、にぎやかなサバイバル。",
-    players: "2–8人",
-    accent: "cyan",
-  },
-];
-
 const PLACES = [LOBBY, ...GAMES];
 
 function isPlaceId(value: unknown): value is PlaceId {
@@ -99,19 +52,6 @@ function shortId(id: string) {
   return id.slice(0, 5).toUpperCase();
 }
 
-function hash(seed: number) {
-  const x = Math.sin(seed * 999.91) * 43758.5453;
-  return x - Math.floor(x);
-}
-
-function gems(now: number) {
-  const phase = Math.floor(now / 9000);
-  return Array.from({ length: 18 }, (_, i) => ({
-    id: `${phase}:${i}`,
-    x: 70 + hash(phase * 47 + i * 3) * (WIDTH - 140),
-    y: 70 + hash(phase * 53 + i * 7) * (HEIGHT - 140),
-  }));
-}
 
 function receiveRemotePlayer(
   players: Map<string, Player>,
@@ -478,7 +418,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
 function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceId; onSend: (text: string) => void }) {
   type ChatSize = "collapsed" | "compact" | "expanded";
   const [draft, setDraft] = useState("");
-  const [size, setSize] = useState<ChatSize>(() => window.matchMedia("(max-width: 600px)").matches ? "collapsed" : "compact");
+  const [size, setSize] = useState<ChatSize>("compact");
   const [inputActive, setInputActive] = useState(false);
   const [unread, setUnread] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
@@ -524,8 +464,8 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   }, [chats, size]);
 
   useEffect(() => {
-    if (!window.matchMedia("(max-width: 600px)").matches) return;
-    setSize(place === "lobby" ? "compact" : "collapsed");
+    if (!window.matchMedia("(max-width: 900px)").matches) return;
+    setSize("compact");
   }, [place]);
 
   useEffect(() => {
@@ -802,7 +742,7 @@ function MobileController({ onMove, onAction, actionLabel }: {
 }
 
 function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound, onLeave }: {
-  game: (typeof GAMES)[number];
+  game: GameDefinition;
   name: string;
   sound: boolean;
   chats: ChatEntry[];
@@ -864,7 +804,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     remoteMotionsRef.current.clear();
     playersRef.current.set(selfId, existing ?? {
       id: selfId, name: name || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
-      vx: 0, vy: 0, color, score: 0, crown: game.id === "crown-chase", seen: now,
+      vx: 0, vy: 0, color, score: 0, crown: game.initialCrown, seen: now,
     });
     setConnected(1);
 
@@ -927,44 +867,17 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       if (!dx) me.vx *= Math.pow(0.01, dt); if (!dy) me.vy *= Math.pow(0.01, dt);
       me.x += me.vx * dt; me.y += me.vy * dt;
 
-      if (game.id === "pulse-push") {
-        const outside = me.x < 25 || me.x > WIDTH - 25 || me.y < 25 || me.y > HEIGHT - 25;
-        if (outside) { me.x = WIDTH / 2; me.y = HEIGHT / 2; me.vx = me.vy = 0; me.score = Math.max(0, me.score - 1); playTone(70); }
-      } else {
-        me.x = Math.max(24, Math.min(WIDTH - 24, me.x)); me.y = Math.max(24, Math.min(HEIGHT - 24, me.y));
-      }
-
-      if (game.id === "gem-sprint") {
-        for (const gem of gems(now)) {
-          if (!collectedRef.current.has(gem.id) && Math.hypot(me.x - gem.x, me.y - gem.y) < 28) {
-            collectedRef.current.add(gem.id); me.score += 1; playTone(640 + me.score * 10);
-          }
-        }
-      }
-      if (game.id === "crown-chase") {
-        const living = [...playersRef.current.values()].filter((player) => now - player.seen < 8_000);
-        const crowned = living.find((player) => player.crown) ?? living.sort((a, b) => a.id.localeCompare(b.id))[0];
-        me.crown = crowned?.id === me.id;
-        if (me.crown) me.score += dt * 4;
-        for (const player of living) {
-          if (player.id !== me.id && player.crown && Math.hypot(me.x - player.x, me.y - player.y) < 34) {
-            me.crown = true; player.crown = false; playTone(880);
-          }
-        }
-      }
       pulsesRef.current = pulsesRef.current.filter((pulse) => now - pulse.born < 750);
-      if (game.id === "pulse-push") {
-        for (const pulse of pulsesRef.current) {
-          if (pulse.owner === selfId) continue;
-          const age = now - pulse.born; const radius = 25 + age * 0.32;
-          const distance = Math.hypot(me.x - pulse.x, me.y - pulse.y);
-          if (distance > radius - 18 && distance < radius + 18) {
-            me.vx += (me.x - pulse.x) / Math.max(distance, 1) * 18;
-            me.vy += (me.y - pulse.y) / Math.max(distance, 1) * 18;
-          }
-        }
-        me.score += dt;
-      }
+      game.update({
+        me,
+        players: playersRef.current,
+        pulses: pulsesRef.current,
+        collected: collectedRef.current,
+        now,
+        dt,
+        selfId,
+        playTone,
+      });
 
       if (time - lastSend > 66) {
         lastSend = time; me.seen = now;
@@ -977,7 +890,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       }
       if (time - lastBoard > 300) { lastBoard = time; setScoreboard([...playersRef.current.values()].sort((a, b) => b.score - a.score)); }
 
-      drawGame(context, game.id, [...playersRef.current.values()], pulsesRef.current, collectedRef.current, chatsRef.current, now);
+      drawGame(context, game, [...playersRef.current.values()], pulsesRef.current, collectedRef.current, chatsRef.current, now);
       frame = requestAnimationFrame(loop);
     };
     frame = requestAnimationFrame(loop);
@@ -1005,15 +918,15 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
           ))}
         </aside>
       </section>
-      <MobileController onMove={setStick} onAction={game.id === "pulse-push" ? triggerPulse : undefined} actionLabel={game.id === "pulse-push" ? "PULSE" : "A"} />
-      <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.id === "pulse-push" && <span><kbd>SPACE</kbd> パルス</span>}<span><kbd>ENTER</kbd> チャット</span><p>{game.description}</p></div>
+      <MobileController onMove={setStick} onAction={game.action === "pulse" ? triggerPulse : undefined} actionLabel={game.actionLabel} />
+      <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.action === "pulse" && <span><kbd>SPACE</kbd> パルス</span>}<span><kbd>ENTER</kbd> チャット</span><p>{game.description}</p></div>
     </main>
   );
 }
 
 function drawGame(
   context: CanvasRenderingContext2D,
-  gameId: GameId,
+  game: GameDefinition,
   players: Player[],
   pulses: Pulse[],
   collected: Set<string>,
@@ -1025,18 +938,8 @@ function drawGame(
   context.strokeStyle = "rgba(104,230,193,.08)"; context.lineWidth = 1;
   for (let x = 0; x <= WIDTH; x += 32) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, HEIGHT); context.stroke(); }
   for (let y = 0; y <= HEIGHT; y += 32) { context.beginPath(); context.moveTo(0, y); context.lineTo(WIDTH, y); context.stroke(); }
-  context.strokeStyle = gameId === "pulse-push" ? "#ff6b8a" : "#233247"; context.lineWidth = 5; context.strokeRect(14, 14, WIDTH - 28, HEIGHT - 28);
-
-  if (gameId === "gem-sprint") for (const gem of gems(now)) if (!collected.has(gem.id)) {
-    const pulse = 1 + Math.sin(now / 180 + gem.x) * .12;
-    context.save(); context.translate(gem.x, gem.y); context.scale(pulse, pulse); context.rotate(Math.PI / 4);
-    context.shadowBlur = 18; context.shadowColor = "#f9e547"; context.fillStyle = "#f9e547"; context.fillRect(-9, -9, 18, 18); context.restore();
-  }
-  for (const pulse of pulses) {
-    const radius = 25 + (now - pulse.born) * .32;
-    context.beginPath(); context.arc(pulse.x, pulse.y, radius, 0, Math.PI * 2);
-    context.strokeStyle = `rgba(255,107,138,${Math.max(0, 1 - (now - pulse.born) / 750)})`; context.lineWidth = 10; context.stroke();
-  }
+  context.strokeStyle = game.id === "pulse-push" ? "#ff6b8a" : "#233247"; context.lineWidth = 5; context.strokeRect(14, 14, WIDTH - 28, HEIGHT - 28);
+  game.draw({ context, pulses, collected, now });
 
   const recentChats = recentChatMap(chats, now);
   for (const player of players) drawAvatar(context, player, recentChats.get(player.id));

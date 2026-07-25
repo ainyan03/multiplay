@@ -111,7 +111,8 @@ html.controller-active,html.controller-active body,html.controller-active * { us
 @media (max-width:900px) {
   .game-stage { grid-template-columns:1fr; padding-bottom:10px; }.score-panel { display:none; }
   .play-header { grid-template-columns:auto 1fr; }.play-title { justify-self:center; }.play-status { grid-column:1/-1; justify-self:center; margin-top:10px; }.controls-bar p { display:none; }
-  .has-chat,body:has(.chat-panel.collapsed) .has-chat { padding-bottom:190px; }
+  .has-chat { padding-bottom:162px; }
+  body:has(.chat-panel.collapsed) .has-chat { padding-bottom:72px; }
   .mobile-controller { position:fixed; z-index:55; inset:0; display:flex; align-items:flex-end; justify-content:space-between; padding:0 max(14px,env(safe-area-inset-right)) max(66px,calc(env(safe-area-inset-bottom) + 58px)) max(14px,env(safe-area-inset-left)); pointer-events:none; transition:opacity .16s ease; }
   .analog-stick { position:relative; flex:0 0 130px; width:130px; height:130px; border:2px solid rgba(113,137,165,.58); border-radius:50%; pointer-events:auto; touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; background:radial-gradient(circle,rgba(24,43,67,.58) 0 28%,rgba(14,28,46,.42) 29% 58%,rgba(20,36,58,.32) 59%); box-shadow:inset 0 0 18px rgba(7,16,29,.45),0 4px 0 rgba(38,58,83,.48),0 7px 20px rgba(0,0,0,.18); }
   .stick-ring { position:absolute; inset:18px; border:1px solid rgba(130,157,188,.38); border-radius:50%; pointer-events:none; }
@@ -123,7 +124,8 @@ html.controller-active,html.controller-active body,html.controller-active * { us
   .controller-actions .primary-action { width:78px; height:78px; border-radius:50%; color:white; background:rgba(255,96,130,.58); box-shadow:0 4px 0 rgba(135,50,72,.56); font-size:11px; }
   .controller-actions .primary-action:disabled { opacity:.36; filter:grayscale(.5); }
   .controller-actions .chat-action { width:55px; height:55px; border-radius:50%; color:var(--cyan); font-size:9px; }
-  .chat-panel { bottom:0; width:calc(100vw - 16px); height:270px; border-bottom:0; }
+  .chat-panel { bottom:0; width:calc(100vw - 16px); height:140px; grid-template-rows:36px 1fr calc(42px + env(safe-area-inset-bottom)); border-bottom:0; }
+  .chat-panel.compact.input-active { height:min(42dvh,300px); }
   .screen-keyboard-open .mobile-controller { display:none; }
   .screen-keyboard-open .chat-panel { bottom:0; border-bottom:0; }
   .screen-keyboard-open .has-chat { padding-bottom:72px; }
@@ -134,11 +136,11 @@ html.controller-active,html.controller-active body,html.controller-active * { us
   .game-grid { grid-template-columns:1fr; }.game-card { min-height:390px; }.topbar { height:70px; padding:0 14px; }.brand-lockup strong { font-size:18px; }.brand-lockup small { letter-spacing:2px; }.online-pill { padding:8px; box-shadow:3px 3px 0 var(--ink); }
   .hero { padding-top:42px; }.hero h1 { font-size:56px; }.lead br { display:none; }.player-name { margin:0 18px 52px; grid-template-columns:1fr; }.player-name input { font-size:16px; }.player-name span { grid-column:1; }.game-section { padding:54px 14px 76px; }.section-title span { display:none; }
   footer { justify-content:center; } footer span { display:none; }.play-header { padding:10px; }.play-title>span { display:none; }.play-title strong { font-size:12px; }.play-status { font-size:10px; }.play-status button { margin-left:7px; padding:8px; }.game-stage { padding:8px; }.controls-bar { display:none; }.occupancy-strip { justify-content:flex-start; }
-  .chat-panel { left:50%; right:auto; width:calc(100vw - 16px); height:270px; max-height:calc(100dvh - 16px); }.chat-panel.expanded { width:calc(100vw - 16px); height:min(62dvh,500px); }
+  .chat-panel { left:50%; right:auto; width:calc(100vw - 16px); height:140px; max-height:calc(100dvh - 16px); }.chat-panel.expanded { width:calc(100vw - 16px); height:min(62dvh,500px); }
   .chat-heading em { max-width:38vw; }.chat-tools small { display:none; }
 }
 @media (min-width:640px) and (max-width:900px) {
-  .chat-panel { bottom:0; width:calc(100vw - 16px); height:230px; border-bottom:0; }
+  .chat-panel { bottom:0; width:calc(100vw - 16px); height:140px; border-bottom:0; }
   .chat-panel.expanded { width:calc(100vw - 16px); height:min(68dvh,500px); }
 }
 @media (max-width:900px) and (orientation:landscape) {
@@ -148,7 +150,8 @@ html.controller-active,html.controller-active body,html.controller-active * { us
   .mobile-controller { padding-bottom:max(66px,calc(env(safe-area-inset-bottom) + 58px)); }
   .analog-stick { transform:scale(.82); transform-origin:left bottom; }
   .controller-actions { transform:scale(.85); transform-origin:right bottom; }
-  .chat-panel { left:50%; right:auto; transform:translateX(-50%); bottom:0; width:calc(100vw - 16px); height:190px; border-bottom:0; }
+  .chat-panel { left:50%; right:auto; transform:translateX(-50%); bottom:0; width:calc(100vw - 16px); height:136px; border-bottom:0; }
+  .chat-panel.compact.input-active { height:min(58dvh,220px); }
   .chat-panel.expanded { width:calc(100vw - 16px); height:min(68dvh,500px); }
   .has-chat,body:has(.chat-panel.collapsed) .has-chat { padding-bottom:0; }
   .portal-prompt { bottom:6px; font-size:9px; }
