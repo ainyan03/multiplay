@@ -27,6 +27,7 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.ok(scripts.some((source) => source.includes("input-active")));
   assert.ok(scripts.some((source) => source.includes("receivedAt")));
   assert.ok(scripts.some((source) => source.includes("クリックまたはタップでメッセージを入力")));
+  assert.ok(scripts.some((source) => source.includes("ENTER / CHAT またはここをタップして入力")));
   assert.ok(scripts.some((source) => source.includes("LOBBY MAP")));
   assert.ok(scripts.some((source) => source.includes("multiplay:chat-focus")));
   await access(new URL("../dist/og.png", import.meta.url));

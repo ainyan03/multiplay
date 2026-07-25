@@ -652,10 +652,16 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           enterKeyHint="send"
           inputMode="text"
           maxLength={180}
-          placeholder="メッセージを入力…"
+          placeholder={inputActive ? "メッセージを入力…" : "ENTER / CHAT またはここをタップして入力"}
+          readOnly={!inputActive}
           rows={1}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
+          onPointerDown={(event) => {
+            if (inputActive) return;
+            event.preventDefault();
+            focusChat();
+          }}
           onFocus={() => {
             setInputActive(true);
             focusHeightRef.current = Math.max(restingHeightRef.current, window.visualViewport?.height ?? window.innerHeight);
@@ -682,7 +688,15 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
             }
           }}
         />
-        <button aria-label="送信" type="submit">SEND</button>
+        <button
+          aria-label={inputActive ? "送信" : "メッセージ入力を開始"}
+          type={inputActive ? "submit" : "button"}
+          onPointerDown={(event) => {
+            if (inputActive) return;
+            event.preventDefault();
+            focusChat();
+          }}
+        >{inputActive ? "SEND" : "CHAT"}</button>
       </form>
     </aside>
   );
