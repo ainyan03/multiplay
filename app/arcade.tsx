@@ -484,6 +484,7 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const logPointerRef = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
   const previousCountRef = useRef(chats.length);
   const atBottomRef = useRef(true);
   const focusHeightRef = useRef(0);
@@ -582,6 +583,24 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
     if (atBottomRef.current) setUnread(0);
   };
 
+  const beginLogPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    logPointerRef.current = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+  };
+
+  const moveLogPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = logPointerRef.current;
+    if (!start || start.id !== event.pointerId) return;
+    if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 7) start.moved = true;
+  };
+
+  const endLogPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = logPointerRef.current;
+    logPointerRef.current = null;
+    const selection = window.getSelection();
+    if (!start || start.id !== event.pointerId || start.moved || (selection && !selection.isCollapsed)) return;
+    focusChat();
+  };
+
   const openChat = () => {
     setSize("compact");
     setUnread(0);
@@ -608,7 +627,17 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           }} aria-label={size === "collapsed" ? "チャットを開く" : "チャットを最小化する"}>{size === "collapsed" ? "+" : "−"}</button>
         </div>
       </header>
-      <div className="chat-log" ref={logRef} onScroll={handleScroll} aria-live="polite">
+      <div
+        className="chat-log"
+        ref={logRef}
+        onScroll={handleScroll}
+        onPointerDown={beginLogPointer}
+        onPointerMove={moveLogPointer}
+        onPointerUp={endLogPointer}
+        onPointerCancel={() => { logPointerRef.current = null; }}
+        aria-label="チャットログ。クリックまたはタップでメッセージを入力"
+        aria-live="polite"
+      >
         {chats.map((chat) => (
           <div className={`chat-message ${chat.system ? "system" : chat.authorId === selfId ? "own" : "other"}`} key={chat.id}>
             <p><b>{chat.name}</b><small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small></p>
