@@ -26,6 +26,8 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.match(chatSource, /OWN_CHAT_HISTORY_LIMIT = 40/);
   assert.match(chatSource, /CHAT_LOG_LIMIT = 100/);
   assert.match(remotePlayers, /sanitizeWirePlayer/);
+  assert.ok(scripts.some((source) => source.includes("pagehide")));
+  assert.ok(scripts.some((source) => source.includes("update-banner")));
   assert.ok(scripts.some((source) => source.includes("enterKeyHint")));
   assert.ok(scripts.some((source) => source.includes("mobile-controller")));
   assert.ok(scripts.some((source) => source.includes("analog-stick")));
