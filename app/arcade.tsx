@@ -303,25 +303,81 @@ function LobbyScreen({ name, counts, onName, onJoin }: {
 }
 
 function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceId; onSend: (text: string) => void }) {
+  type ChatSize = "collapsed" | "compact" | "expanded";
   const [draft, setDraft] = useState("");
+  const [size, setSize] = useState<ChatSize>(() => window.matchMedia("(max-width: 600px)").matches ? "collapsed" : "compact");
+  const [unread, setUnread] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const previousCountRef = useRef(chats.length);
+  const atBottomRef = useRef(true);
 
   useEffect(() => {
     const log = logRef.current;
-    if (log) log.scrollTop = log.scrollHeight;
-  }, [chats]);
+    const added = Math.max(0, chats.length - previousCountRef.current);
+    previousCountRef.current = chats.length;
+    const ownMessage = chats.at(-1)?.authorId === selfId;
+    if (log && size !== "collapsed" && (atBottomRef.current || ownMessage)) {
+      log.scrollTop = log.scrollHeight;
+      setUnread(0);
+    } else if (added > 0 && !ownMessage) {
+      setUnread((current) => current + added);
+    }
+  }, [chats, size]);
 
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
+  useEffect(() => {
+    if (!window.matchMedia("(max-width: 600px)").matches) return;
+    setSize(place === "lobby" ? "compact" : "collapsed");
+  }, [place]);
+
+  useEffect(() => {
+    if (size === "collapsed") return;
+    const log = logRef.current;
+    if (log && atBottomRef.current) log.scrollTop = log.scrollHeight;
+  }, [size]);
+
+  const sendDraft = () => {
     if (!draft.trim()) return;
     onSend(draft);
     setDraft("");
+    setUnread(0);
+    requestAnimationFrame(() => inputRef.current?.focus());
   };
 
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    sendDraft();
+  };
+
+  const handleScroll = () => {
+    const log = logRef.current;
+    if (!log) return;
+    atBottomRef.current = log.scrollHeight - log.scrollTop - log.clientHeight < 28;
+    if (atBottomRef.current) setUnread(0);
+  };
+
+  const openChat = () => {
+    setSize("compact");
+    setUnread(0);
+  };
+
+  const latest = [...chats].reverse().find((chat) => !chat.system);
+
   return (
-    <aside className="chat-panel" aria-label="全体チャット">
-      <header><div><span className="online-dot" /><strong>GLOBAL CHAT</strong></div><small>{PLACES.find((item) => item.id === place)?.shortTitle}</small></header>
-      <div className="chat-log" ref={logRef} aria-live="polite">
+    <aside className={`chat-panel ${size}`} aria-label="全体チャット">
+      <header>
+        <button className="chat-heading" type="button" onClick={size === "collapsed" ? openChat : undefined} aria-expanded={size !== "collapsed"}>
+          <span className="online-dot" /><strong>GLOBAL CHAT</strong>
+          {size === "collapsed" && latest && <em><b>{latest.name}</b> {latest.text}</em>}
+          {unread > 0 && <i className="unread-badge">{unread > 99 ? "99+" : unread}</i>}
+        </button>
+        <div className="chat-tools">
+          <small>{PLACES.find((item) => item.id === place)?.shortTitle}</small>
+          {size !== "collapsed" && <button type="button" onClick={() => setSize(size === "expanded" ? "compact" : "expanded")} aria-label={size === "expanded" ? "チャットを通常サイズに戻す" : "チャットを拡大する"}>{size === "expanded" ? "↙" : "↗"}</button>}
+          <button type="button" onClick={() => setSize(size === "collapsed" ? "compact" : "collapsed")} aria-label={size === "collapsed" ? "チャットを開く" : "チャットを最小化する"}>{size === "collapsed" ? "+" : "−"}</button>
+        </div>
+      </header>
+      <div className="chat-log" ref={logRef} onScroll={handleScroll} aria-live="polite">
         {chats.map((chat) => (
           <div className={`chat-message ${chat.system ? "system" : ""}`} key={chat.id}>
             <p><b>{chat.name}</b><small>{PLACES.find((item) => item.id === chat.place)?.shortTitle}</small></p>
@@ -330,13 +386,27 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
         ))}
       </div>
       <form onSubmit={submit}>
-        <input
+        <textarea
+          ref={inputRef}
           aria-label="チャットメッセージ"
+          enterKeyHint="send"
+          inputMode="text"
           maxLength={180}
           placeholder="メッセージを入力…"
+          rows={1}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => event.stopPropagation()}
+          onFocus={() => {
+            if (size === "collapsed") setSize("compact");
+            requestAnimationFrame(() => inputRef.current?.scrollIntoView({ block: "nearest" }));
+          }}
+          onKeyDown={(event) => {
+            event.stopPropagation();
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              sendDraft();
+            }
+          }}
         />
         <button aria-label="送信" type="submit">SEND</button>
       </form>
@@ -381,6 +451,21 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
     oscillator.start(); oscillator.stop(context.currentTime + 0.1);
   }, [sound]);
 
+  const triggerPulse = useCallback(() => {
+    if (game.id !== "pulse-push") return;
+    const me = playersRef.current.get(selfId);
+    if (!me) return;
+    const pulse = { id: `${selfId}:${Date.now()}`, x: me.x, y: me.y, born: Date.now(), owner: selfId };
+    pulsesRef.current.push(pulse);
+    void sendPulseRef.current?.(pulse);
+    playTone(120);
+  }, [game.id, playTone]);
+
+  const setTouchKey = (key: string, pressed: boolean) => {
+    if (pressed) keysRef.current.add(key);
+    else keysRef.current.delete(key);
+  };
+
   useEffect(() => {
     const now = Date.now();
     playersRef.current.set(selfId, {
@@ -418,17 +503,12 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
       keysRef.current.add(event.key.toLowerCase());
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(event.key)) event.preventDefault();
-      if (event.key === " " && game.id === "pulse-push") {
-        const me = playersRef.current.get(selfId);
-        if (!me) return;
-        const pulse = { id: `${selfId}:${Date.now()}`, x: me.x, y: me.y, born: Date.now(), owner: selfId };
-        pulsesRef.current.push(pulse); void sendPulseRef.current?.(pulse); playTone(120);
-      }
+      if (event.key === " ") triggerPulse();
     };
     const up = (event: KeyboardEvent) => keysRef.current.delete(event.key.toLowerCase());
     window.addEventListener("keydown", down); window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
-  }, [game.id, playTone]);
+  }, [triggerPulse]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -526,6 +606,15 @@ function GameScreen({ game, name, sound, chats, counts, onSound, onLeave }: {
           ))}
         </aside>
       </section>
+      <div className="mobile-controls" aria-label="タッチ操作">
+        <div className="touch-dpad">
+          <button className="up" aria-label="上へ移動" onPointerDown={() => setTouchKey("arrowup", true)} onPointerUp={() => setTouchKey("arrowup", false)} onPointerCancel={() => setTouchKey("arrowup", false)} onPointerLeave={() => setTouchKey("arrowup", false)}>▲</button>
+          <button className="left" aria-label="左へ移動" onPointerDown={() => setTouchKey("arrowleft", true)} onPointerUp={() => setTouchKey("arrowleft", false)} onPointerCancel={() => setTouchKey("arrowleft", false)} onPointerLeave={() => setTouchKey("arrowleft", false)}>◀</button>
+          <button className="down" aria-label="下へ移動" onPointerDown={() => setTouchKey("arrowdown", true)} onPointerUp={() => setTouchKey("arrowdown", false)} onPointerCancel={() => setTouchKey("arrowdown", false)} onPointerLeave={() => setTouchKey("arrowdown", false)}>▼</button>
+          <button className="right" aria-label="右へ移動" onPointerDown={() => setTouchKey("arrowright", true)} onPointerUp={() => setTouchKey("arrowright", false)} onPointerCancel={() => setTouchKey("arrowright", false)} onPointerLeave={() => setTouchKey("arrowright", false)}>▶</button>
+        </div>
+        {game.id === "pulse-push" && <button className="touch-action" onPointerDown={triggerPulse}>PULSE</button>}
+      </div>
       <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.id === "pulse-push" && <span><kbd>SPACE</kbd> パルス</span>}<p>{game.description}</p></div>
     </main>
   );
