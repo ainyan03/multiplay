@@ -12,6 +12,7 @@ import {
   type PlayerState,
   type PulseState,
 } from "./games";
+import { resolveLobbyCollisions } from "./lobbyPhysics";
 
 type PlaceId = "lobby" | GameId;
 type Player = PlayerState;
@@ -364,8 +365,10 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       me.vx += (dx * 285 - me.vx) * Math.min(dt * 9, 1);
       me.vy += (dy * 285 - me.vy) * Math.min(dt * 9, 1);
       if (!dx) me.vx *= Math.pow(.01, dt); if (!dy) me.vy *= Math.pow(.01, dt);
-      me.x = Math.max(25, Math.min(WIDTH - 25, me.x + me.vx * dt));
-      me.y = Math.max(28, Math.min(HEIGHT - 28, me.y + me.vy * dt));
+      me.x += me.vx * dt;
+      me.y += me.vy * dt;
+      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
+      resolveLobbyCollisions(me, playersRef.current, now);
       const closest = LOBBY_PORTALS.find((portal) => Math.hypot(me.x - portal.x, me.y - portal.y) < 76)?.gameId ?? null;
       if (closest !== nearGameRef.current) { nearGameRef.current = closest; setNearGame(closest); }
       if (time - lastSend > 66) {
@@ -373,7 +376,6 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
         const { seen: _seen, ...wire } = me; void _seen;
         void sendStateRef.current?.(wire);
       }
-      smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, dt, now);
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
         playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
       }

@@ -5,6 +5,7 @@ import test from "node:test";
 test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   const html = await readFile(new URL("../dist/index.html", import.meta.url), "utf8");
   const gameDefinitions = await readFile(new URL("../app/games.ts", import.meta.url), "utf8");
+  const lobbyPhysics = await readFile(new URL("../app/lobbyPhysics.ts", import.meta.url), "utf8");
   const assets = await readdir(new URL("../dist/assets/", import.meta.url));
   const scripts = await Promise.all(
     assets.filter((name) => name.endsWith(".js")).map((name) => readFile(new URL(`../dist/assets/${name}`, import.meta.url), "utf8")),
@@ -32,6 +33,8 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.ok(scripts.some((source) => source.includes("chat-focus-active")));
   assert.match(gameDefinitions, /export type GameDefinition/);
   assert.match(gameDefinitions, /GAME_DEFINITIONS/);
+  assert.match(lobbyPhysics, /resolveLobbyCollisions/);
+  assert.match(lobbyPhysics, /RESTITUTION/);
   assert.ok(scripts.some((source) => source.includes("LOBBY MAP")));
   assert.ok(scripts.some((source) => source.includes("multiplay:chat-focus")));
   await access(new URL("../dist/og.png", import.meta.url));
