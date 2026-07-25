@@ -30,6 +30,14 @@ npm test
 
 `http://localhost:3000` を複数タブまたは複数端末で開き、同じゲームに参加すると接続できます。公開Nostrリレーを利用するためインターネット接続が必要です。
 
+## 公開
+
+GitHub の `ainyan03/multiplay` リポジトリへ `main` ブランチを送ると、GitHub Actions がテストと静的ビルドを実行し、GitHub Pagesへ自動公開します。
+
+公開URL: `https://ainyan03.github.io/multiplay/`
+
+初回のみGitHubリポジトリの **Settings → Pages → Source** を **GitHub Actions** に設定してください。Giteaの `ainyan/multiplay` は開発元、GitHubは公開用ミラーとして利用できます。
+
 ## ゲーム追加の方針
 
 ゲーム選択情報は `app/arcade.tsx` の `GAMES`、ゲームルールは同ファイルの更新ループと描画処理にまとまっています。次の段階ではゲームごとに `GameDefinition`（初期化・更新・描画・イベント処理）へ分離し、共通のルーム接続・プレイヤー同期を再利用する構成に拡張できます。
