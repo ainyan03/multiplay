@@ -40,6 +40,7 @@ import { correctedRoomNow, observeSkew, peerSkews, type SkewStore } from "./cloc
 import { applyLobbyImpulse, isLobbyImpulsePlausible, resolveLobbyCollisions, steerLobbyPlayer } from "./lobbyPhysics.ts";
 import { advanceFixedSteps } from "./timestep.ts";
 import {
+  appIdFor,
   isNewerVersion,
   parseLobbyImpulse,
   parsePresence,
@@ -53,7 +54,8 @@ import { receiveRemotePlayer, smoothRemotePlayers, toWirePlayer, type RemoteMoti
 type Player = PlayerState;
 
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
-const APP_ID = "ainyan-multiplay-arcade-v2";
+// Keyed by where the page came from, so a dev tab never lands in the public rooms.
+const APP_ID = appIdFor(window.location.hostname);
 const CHAT_VISIBLE_MS = 6_000;
 // 60Hz, with a small cap so a tab returning from the background catches up
 // without replaying every step it missed.

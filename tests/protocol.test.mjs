@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isNewerVersion, parseLobbyImpulse, parsePresence, PROTO_VERSION } from "../app/protocol.ts";
+import { appIdFor, isNewerVersion, parseLobbyImpulse, parsePresence, PROTO_VERSION, worldKey } from "../app/protocol.ts";
 import { boundedString, finite, integer, record } from "../app/validate.ts";
 
 const NOW = 1_000_000;
@@ -27,6 +27,34 @@ test("boundedString rejects empty and oversized strings", () => {
   assert.equal(boundedString("", 4), false);
   assert.equal(boundedString("toolong", 4), false);
   assert.equal(boundedString(7, 4), false);
+});
+
+test("worldKey keeps the published site apart from anything served locally", () => {
+  assert.equal(worldKey("ainyan03.github.io"), "ainyan03.github.io");
+  assert.notEqual(worldKey("localhost"), worldKey("ainyan03.github.io"));
+  assert.notEqual(worldKey("staging.example.com"), worldKey("ainyan03.github.io"));
+  assert.equal(worldKey("AINYAN03.GITHUB.IO"), "ainyan03.github.io", "hostnames are case-insensitive");
+});
+
+test("worldKey puts every locally served address in one world", () => {
+  // A phone opening the dev server over the LAN must still meet the desktop.
+  for (const host of ["localhost", "127.0.0.1", "::1", "192.168.1.5", "10.0.0.3", "172.16.4.2", "macbook.local"]) {
+    assert.equal(worldKey(host), "local", `${host} is local`);
+  }
+});
+
+test("worldKey does not mistake a public address for a private one", () => {
+  // 172.32/12 is outside the private range, as is anything merely starting with 10.
+  assert.equal(worldKey("172.32.0.1"), "172.32.0.1");
+  assert.equal(worldKey("104.20.1.1"), "104.20.1.1");
+  assert.equal(worldKey("10.example.com"), "10.example.com");
+});
+
+test("appIdFor separates worlds but stays stable for one host", () => {
+  assert.equal(appIdFor("localhost"), appIdFor("192.168.0.9"), "one local world");
+  assert.notEqual(appIdFor("localhost"), appIdFor("ainyan03.github.io"));
+  assert.equal(appIdFor("ainyan03.github.io"), appIdFor("ainyan03.github.io"));
+  assert.ok(appIdFor("ainyan03.github.io").startsWith("ainyan-multiplay-arcade-v2-"));
 });
 
 test("isNewerVersion only fires for a plausible higher version", () => {
