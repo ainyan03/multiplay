@@ -417,7 +417,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
         </div>
       </section>
       <MobileController onMove={setStick} onAction={nearGame ? enterPortal : undefined} actionLabel="A" />
-      <div className="controls-bar lobby-controls"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span><span><kbd>SPACE</kbd> 入口に入る</span><p>マップ上の入口に近づくと、参加中の人数とゲーム名を確認できます。</p></div>
+      <div className="controls-bar lobby-controls"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span><span><kbd>SPACE</kbd> 入口に入る</span><span><kbd>ENTER</kbd> チャット</span><p>マップ上の入口に近づくと、参加中の人数とゲーム名を確認できます。</p></div>
     </main>
   );
 }
@@ -434,6 +434,11 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   const focusHeightRef = useRef(0);
   const restingHeightRef = useRef(window.visualViewport?.height ?? window.innerHeight);
   const keyboardOpenRef = useRef(false);
+
+  const focusChat = useCallback(() => {
+    flushSync(() => setSize("compact"));
+    inputRef.current?.focus({ preventScroll: true });
+  }, []);
 
   const updateKeyboardState = useCallback(() => {
     const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
@@ -471,16 +476,21 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
   }, [size]);
 
   useEffect(() => {
-    const focusChat = () => {
-      flushSync(() => setSize("compact"));
-      inputRef.current?.focus({ preventScroll: true });
+    const onKeyboardShortcut = (event: KeyboardEvent) => {
+      if (!window.matchMedia("(pointer: fine)").matches || event.key !== "Enter" || event.repeat || event.isComposing) return;
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (event.target instanceof HTMLButtonElement || event.target instanceof HTMLTextAreaElement) return;
+      event.preventDefault();
+      focusChat();
     };
     window.addEventListener("multiplay:chat-focus", focusChat);
+    window.addEventListener("keydown", onKeyboardShortcut);
     return () => {
       window.removeEventListener("multiplay:chat-focus", focusChat);
+      window.removeEventListener("keydown", onKeyboardShortcut);
       document.documentElement.classList.remove("screen-keyboard-open");
     };
-  }, []);
+  }, [focusChat]);
 
   useEffect(() => {
     const viewport = window.visualViewport;
@@ -569,8 +579,10 @@ function ChatPanel({ chats, place, onSend }: { chats: ChatEntry[]; place: PlaceI
           onKeyDown={(event) => {
             event.stopPropagation();
             if (event.key === "Enter" && !event.shiftKey) {
+              if (event.nativeEvent.isComposing) return;
               event.preventDefault();
-              sendDraft();
+              if (draft.trim()) sendDraft();
+              else inputRef.current?.blur();
             }
           }}
         />
@@ -874,7 +886,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
         </aside>
       </section>
       <MobileController onMove={setStick} onAction={game.id === "pulse-push" ? triggerPulse : undefined} actionLabel={game.id === "pulse-push" ? "PULSE" : "A"} />
-      <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.id === "pulse-push" && <span><kbd>SPACE</kbd> パルス</span>}<p>{game.description}</p></div>
+      <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.id === "pulse-push" && <span><kbd>SPACE</kbd> パルス</span>}<span><kbd>ENTER</kbd> チャット</span><p>{game.description}</p></div>
     </main>
   );
 }
