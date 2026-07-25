@@ -20,15 +20,25 @@ import {
   GAME_HEIGHT as HEIGHT,
   GAME_WIDTH as WIDTH,
   PLAYER_NAME_LIMIT,
-  PULSE_LIFETIME_MS,
-  sanitizePulse,
   type GameDefinition,
   type GameId,
   type PlaceId,
   type PlayerState,
-  type PulseState,
 } from "./games.ts";
+import {
+  addBomb,
+  createArenaRuntime,
+  drawArena,
+  drawDeathOverlay,
+  sanitizeBombEvent,
+  stepArena,
+  tryPlaceBomb,
+} from "./arenaGame.ts";
+import { dropNpcsOwnedBy, receiveNpcSnapshot, sanitizeNpcSnapshot, toWireNpcs, type NpcSnapshot } from "./arenaNpc.ts";
+import { cellCenterX, cellCenterY, SPAWN_CELLS, type ArenaSnapshot, type BombEvent } from "./arena.ts";
+import { correctedRoomNow, observeSkew, peerSkews, type SkewStore } from "./clock.ts";
 import { applyLobbyImpulse, isLobbyImpulsePlausible, resolveLobbyCollisions, steerLobbyPlayer } from "./lobbyPhysics.ts";
+import { advanceFixedSteps } from "./timestep.ts";
 import {
   isNewerVersion,
   parseLobbyImpulse,
@@ -41,11 +51,15 @@ import {
 import { receiveRemotePlayer, smoothRemotePlayers, toWirePlayer, type RemoteMotion, type WirePlayer } from "./remotePlayers.ts";
 
 type Player = PlayerState;
-type Pulse = PulseState;
 
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
+// 60Hz, with a small cap so a tab returning from the background catches up
+// without replaying every step it missed.
+const ARENA_STEP_MS = 1000 / 60;
+const ARENA_MAX_STEPS = 5;
+const NPC_SEND_MS = 200;
 // Monotonic across room changes and rejoins, so a peer that reconnects is never
 // mistaken for one replaying old updates.
 let stateSeq = 0;
@@ -266,7 +280,11 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
 }
 
 export function Arcade() {
-  const [gameId, setGameId] = useState<GameId | null>(null);
+  // `?game=<id>` opens a game straight away, so a link can point at one.
+  const [gameId, setGameId] = useState<GameId | null>(() => {
+    const requested = new URLSearchParams(window.location.search).get("game");
+    return GAMES.some((game) => game.id === requested) ? (requested as GameId) : null;
+  });
   const [name, setName] = useState(() => `PLAYER-${Math.floor(100 + Math.random() * 900)}`);
   const [sound, setSound] = useState(true);
   const { epoch: connectionEpoch } = useReconnectEpoch();
@@ -349,8 +367,9 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   const broadcastState = useCallback(() => {
     const me = playersRef.current.get(selfId);
     if (!me) return;
-    me.seen = Date.now();
-    void sendStateRef.current?.(toWirePlayer(me, nextStateSeq()));
+    const now = Date.now();
+    me.seen = now;
+    void sendStateRef.current?.(toWirePlayer(me, nextStateSeq(), now));
   }, []);
 
   useEffect(() => {
@@ -847,11 +866,13 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playersRef = useRef<Map<string, Player>>(new Map());
   const remoteMotionsRef = useRef<Map<string, RemoteMotion>>(new Map());
-  const pulsesRef = useRef<Pulse[]>([]);
+  const arenaRef = useRef(createArenaRuntime());
   const keysRef = useRef(new Set<string>());
   const stickRef = useRef({ x: 0, y: 0 });
   const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
-  const sendPulseRef = useRef<((pulse: Pulse) => Promise<void>) | null>(null);
+  const sendBombRef = useRef<((bomb: BombEvent) => Promise<void>) | null>(null);
+  const sendNpcsRef = useRef<((snapshot: NpcSnapshot) => Promise<void>) | null>(null);
+  const skewRef = useRef<SkewStore>(new Map());
   const collectedRef = useRef(new Set<string>());
   const chatsRef = useRef(chats);
   const nameRef = useRef(name);
@@ -883,22 +904,25 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     oscillator.start(); oscillator.stop(context.currentTime + 0.1);
   }, []);
 
-  const triggerPulse = useCallback(() => {
-    if (game.id !== "pulse-push") return;
+  const triggerAction = useCallback(() => {
+    if (game.kind !== "arena") return;
     const me = playersRef.current.get(selfId);
     if (!me) return;
-    const pulse = { id: `${selfId}:${Date.now()}`, x: me.x, y: me.y, born: Date.now(), owner: selfId };
-    pulsesRef.current.push(pulse);
-    void sendPulseRef.current?.(pulse);
-    playTone(120);
-  }, [game.id, playTone]);
+    const roomNow = correctedRoomNow(Date.now(), peerSkews(skewRef.current));
+    const bomb = tryPlaceBomb(arenaRef.current, me, selfId, roomNow);
+    if (!bomb) return;
+    addBomb(arenaRef.current, bomb);
+    void sendBombRef.current?.(bomb);
+    playTone(180);
+  }, [game.kind, playTone]);
 
   const setStick = useCallback((x: number, y: number) => { stickRef.current = { x, y }; }, []);
   const broadcastState = useCallback(() => {
     const me = playersRef.current.get(selfId);
     if (!me) return;
-    me.seen = Date.now();
-    void sendStateRef.current?.(toWirePlayer(me, nextStateSeq()));
+    const now = Date.now();
+    me.seen = now;
+    void sendStateRef.current?.(toWirePlayer(me, nextStateSeq(), now));
   }, []);
 
   useEffect(() => {
@@ -906,23 +930,45 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     const existing = playersRef.current.get(selfId);
     playersRef.current.clear();
     remoteMotionsRef.current.clear();
+    skewRef.current.clear();
+    // Bombs and enemies belong to the room we just left, not the one we joined.
+    arenaRef.current = createArenaRuntime();
+    const spawn = game.kind === "arena" ? SPAWN_CELLS[0]! : null;
     playersRef.current.set(selfId, existing ?? {
-      id: selfId, name: nameRef.current || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
+      id: selfId, name: nameRef.current || "PLAYER",
+      x: spawn ? cellCenterX(spawn.col) : WIDTH / 2,
+      y: spawn ? cellCenterY(spawn.row) : HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, crown: game.initialCrown, seen: now,
     });
+    if (spawn && existing) {
+      // Coming from another room, the carried-over position may be inside a wall.
+      existing.x = cellCenterX(spawn.col);
+      existing.y = cellCenterY(spawn.row);
+      existing.vx = 0;
+      existing.vy = 0;
+    }
     setConnected(1);
 
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, `public-${game.id}`);
     const stateAction = room.makeAction<WirePlayer>("player-state");
-    const pulseAction = room.makeAction<Pulse>("pulse");
+    const bombAction = room.makeAction<BombEvent>("bomb-v1");
+    const npcAction = room.makeAction<NpcSnapshot>("npc-v1");
     sendStateRef.current = (state) => stateAction.send(state);
-    sendPulseRef.current = (pulse) => pulseAction.send(pulse);
+    sendBombRef.current = (bomb) => bombAction.send(bomb);
+    sendNpcsRef.current = (snapshot) => npcAction.send(snapshot);
     stateAction.onMessage = (state, { peerId }) => {
-      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, Date.now());
+      const receivedAt = Date.now();
+      const accepted = receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, receivedAt);
+      if (accepted?.ts !== undefined) observeSkew(skewRef.current, peerId, accepted.ts, receivedAt);
     };
-    pulseAction.onMessage = (payload, { peerId }) => {
-      const pulse = sanitizePulse(payload, peerId, Date.now());
-      if (pulse) pulsesRef.current.push(pulse);
+    bombAction.onMessage = (payload, { peerId }) => {
+      const roomNow = correctedRoomNow(Date.now(), peerSkews(skewRef.current));
+      const bomb = sanitizeBombEvent(payload, peerId, roomNow);
+      if (bomb) addBomb(arenaRef.current, bomb);
+    };
+    npcAction.onMessage = (payload, { peerId }) => {
+      const npcs = sanitizeNpcSnapshot(payload, peerId);
+      if (npcs) receiveNpcSnapshot(arenaRef.current.remoteNpcs, npcs, peerId, Date.now());
     };
     room.onPeerJoin = () => {
       notePeerMet();
@@ -932,19 +978,28 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     room.onPeerLeave = (peerId) => {
       playersRef.current.delete(peerId);
       remoteMotionsRef.current.delete(peerId);
+      // Enemies exist only while the client running them is here.
+      dropNpcsOwnedBy(arenaRef.current.remoteNpcs, peerId);
       setConnected(Object.keys(room.getPeers()).length + 1);
     };
 
     // See the lobby room for why this is a timer and not the animation frame.
     const stateTimer = window.setInterval(broadcastState, STATE_SEND_MS);
+    const npcTimer = game.kind === "arena"
+      ? window.setInterval(() => {
+        void sendNpcsRef.current?.({ npcs: toWireNpcs(arenaRef.current.npcs), ts: Date.now() });
+      }, NPC_SEND_MS)
+      : 0;
     const onPageHide = () => { void room.leave(); };
     window.addEventListener("pagehide", onPageHide);
 
     return () => {
       window.removeEventListener("pagehide", onPageHide);
       window.clearInterval(stateTimer);
+      if (npcTimer) window.clearInterval(npcTimer);
       sendStateRef.current = null;
-      sendPulseRef.current = null;
+      sendBombRef.current = null;
+      sendNpcsRef.current = null;
       void room.leave();
     };
   }, [broadcastState, color, connectionEpoch, game]);
@@ -954,12 +1009,12 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
       keysRef.current.add(event.key.toLowerCase());
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(event.key)) event.preventDefault();
-      if (event.key === " ") triggerPulse();
+      if (event.key === " ") triggerAction();
     };
     const up = (event: KeyboardEvent) => keysRef.current.delete(event.key.toLowerCase());
     window.addEventListener("keydown", down); window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
-  }, [triggerPulse]);
+  }, [triggerAction]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -967,6 +1022,8 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     const context = canvas.getContext("2d");
     if (!context) return;
     let frame = 0; let previous = performance.now(); let lastBoard = 0;
+    let arenaAccumulator = 0;
+    let arenaSnapshot: ArenaSnapshot | null = null;
 
     const loop = (time: number) => {
       const dt = Math.min((time - previous) / 1000, 0.05); previous = time;
@@ -979,22 +1036,41 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       const keyboardLength = Math.hypot(keyboardX, keyboardY) || 1;
       const dx = keyboardX ? keyboardX / keyboardLength : stickRef.current.x;
       const dy = keyboardY ? keyboardY / keyboardLength : stickRef.current.y;
-      me.vx += (dx * 310 - me.vx) * Math.min(dt * 9, 1);
-      me.vy += (dy * 310 - me.vy) * Math.min(dt * 9, 1);
-      if (!dx) me.vx *= Math.pow(0.01, dt); if (!dy) me.vy *= Math.pow(0.01, dt);
-      me.x += me.vx * dt; me.y += me.vy * dt;
 
-      pulsesRef.current = pulsesRef.current.filter((pulse) => now - pulse.born < PULSE_LIFETIME_MS);
-      game.update({
-        me,
-        players: playersRef.current,
-        pulses: pulsesRef.current,
-        collected: collectedRef.current,
-        now,
-        dt,
-        selfId,
-        playTone,
-      });
+      if (game.kind === "arena") {
+        const roomNow = correctedRoomNow(now, peerSkews(skewRef.current));
+        // Bomb fuses and block regrowth must land on the same tick everywhere,
+        // so the arena advances in fixed steps rather than by frame time.
+        const paced = advanceFixedSteps(arenaAccumulator, dt * 1000, ARENA_STEP_MS, ARENA_MAX_STEPS);
+        arenaAccumulator = paced.accumulator;
+        for (let step = 0; step < paced.steps; step += 1) {
+          arenaSnapshot = stepArena({
+            runtime: arenaRef.current,
+            me,
+            players: playersRef.current,
+            selfId,
+            dirX: dx,
+            dirY: dy,
+            dt: ARENA_STEP_MS / 1000,
+            roomNow: roomNow - (paced.steps - 1 - step) * ARENA_STEP_MS,
+            playTone,
+          });
+        }
+      } else {
+        me.vx += (dx * 310 - me.vx) * Math.min(dt * 9, 1);
+        me.vy += (dy * 310 - me.vy) * Math.min(dt * 9, 1);
+        if (!dx) me.vx *= Math.pow(0.01, dt); if (!dy) me.vy *= Math.pow(0.01, dt);
+        me.x += me.vx * dt; me.y += me.vy * dt;
+        game.update?.({
+          me,
+          players: playersRef.current,
+          collected: collectedRef.current,
+          now,
+          dt,
+          selfId,
+          playTone,
+        });
+      }
 
       smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, selfId, dt, now);
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
@@ -1002,7 +1078,19 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       }
       if (time - lastBoard > 300) { lastBoard = time; setScoreboard([...playersRef.current.values()].sort((a, b) => b.score - a.score)); }
 
-      drawGame(context, game, [...playersRef.current.values()], pulsesRef.current, collectedRef.current, chatsRef.current, now);
+      if (game.kind === "arena" && arenaSnapshot) {
+        const roomNow = correctedRoomNow(now, peerSkews(skewRef.current));
+        drawArena(context, arenaSnapshot, arenaRef.current, roomNow);
+        const recent = recentChatMap(chatsRef.current, now);
+        for (const player of playersRef.current.values()) {
+          // A player waiting to respawn is hidden rather than left standing.
+          if (player.id === selfId && roomNow < arenaRef.current.deadUntil) continue;
+          drawAvatar(context, player, recent.get(player.id));
+        }
+        if (roomNow < arenaRef.current.deadUntil) drawDeathOverlay(context, arenaRef.current.deadUntil - roomNow);
+      } else {
+        drawGame(context, game, [...playersRef.current.values()], collectedRef.current, chatsRef.current, now);
+      }
       frame = requestAnimationFrame(loop);
     };
     frame = requestAnimationFrame(loop);
@@ -1030,8 +1118,8 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
           ))}
         </aside>
       </section>
-      <MobileController onMove={setStick} onAction={game.action === "pulse" ? triggerPulse : undefined} actionLabel={game.actionLabel} />
-      <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.action === "pulse" && <span><kbd>SPACE</kbd> パルス</span>}<span><kbd>ENTER</kbd> チャット</span><p>{game.description}</p></div>
+      <MobileController onMove={setStick} onAction={game.action === "bomb" ? triggerAction : undefined} actionLabel={game.actionLabel} />
+      <div className="controls-bar"><span><kbd>WASD</kbd><kbd>↑↓←→</kbd> 移動</span>{game.action === "bomb" && <span><kbd>SPACE</kbd> 爆弾を置く</span>}<span><kbd>ENTER</kbd> チャット</span><p>{game.description}</p></div>
     </main>
   );
 }
@@ -1040,7 +1128,6 @@ function drawGame(
   context: CanvasRenderingContext2D,
   game: GameDefinition,
   players: Player[],
-  pulses: Pulse[],
   collected: Set<string>,
   chats: ChatEntry[],
   now: number,
@@ -1050,8 +1137,8 @@ function drawGame(
   context.strokeStyle = "rgba(104,230,193,.08)"; context.lineWidth = 1;
   for (let x = 0; x <= WIDTH; x += 32) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, HEIGHT); context.stroke(); }
   for (let y = 0; y <= HEIGHT; y += 32) { context.beginPath(); context.moveTo(0, y); context.lineTo(WIDTH, y); context.stroke(); }
-  context.strokeStyle = game.id === "pulse-push" ? "#ff6b8a" : "#233247"; context.lineWidth = 5; context.strokeRect(14, 14, WIDTH - 28, HEIGHT - 28);
-  game.draw({ context, pulses, collected, now });
+  context.strokeStyle = "#233247"; context.lineWidth = 5; context.strokeRect(14, 14, WIDTH - 28, HEIGHT - 28);
+  game.draw?.({ context, collected, now });
 
   const recentChats = recentChatMap(chats, now);
   for (const player of players) drawAvatar(context, player, recentChats.get(player.id));

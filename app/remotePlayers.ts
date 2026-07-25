@@ -11,6 +11,7 @@ export type WirePlayer = {
   score: number;
   crown?: boolean;
   seq?: number;
+  ts?: number;
 };
 
 export type RemoteMotion = { x: number; y: number; vx: number; vy: number; receivedAt: number; seq: number };
@@ -36,8 +37,9 @@ export function sanitizeWirePlayer(value: unknown): WirePlayer | null {
   if (typeof item.color !== "string" || !COLOR_PATTERN.test(item.color)) return null;
   if (!finite(item.score, 0, MAX_WIRE_SCORE)) return null;
   if (item.crown !== undefined && typeof item.crown !== "boolean") return null;
-  // Older builds predate sequence numbers; those updates stay accepted unordered.
+  // Older builds predate these fields; those updates stay accepted without them.
   if (item.seq !== undefined && !integer(item.seq, 0, Number.MAX_SAFE_INTEGER)) return null;
+  if (item.ts !== undefined && !finite(item.ts, 0, Number.MAX_SAFE_INTEGER)) return null;
   return {
     name: item.name,
     x: item.x,
@@ -48,10 +50,11 @@ export function sanitizeWirePlayer(value: unknown): WirePlayer | null {
     score: item.score,
     ...(item.crown === undefined ? {} : { crown: item.crown }),
     ...(item.seq === undefined ? {} : { seq: item.seq }),
+    ...(item.ts === undefined ? {} : { ts: item.ts }),
   };
 }
 
-export function toWirePlayer(player: PlayerState, seq: number): WirePlayer {
+export function toWirePlayer(player: PlayerState, seq: number, ts: number): WirePlayer {
   return {
     name: player.name,
     x: player.x,
@@ -62,6 +65,7 @@ export function toWirePlayer(player: PlayerState, seq: number): WirePlayer {
     score: player.score,
     ...(player.crown === undefined ? {} : { crown: player.crown }),
     seq,
+    ts,
   };
 }
 
@@ -71,13 +75,13 @@ export function receiveRemotePlayer(
   state: unknown,
   peerId: string,
   receivedAt: number,
-) {
+): WirePlayer | null {
   const sanitized = sanitizeWirePlayer(state);
-  if (!sanitized) return;
+  if (!sanitized) return null;
   const previous = motions.get(peerId);
   // A late packet would otherwise rewind the remote avatar by less than the
   // teleport threshold, which reads as stutter rather than an obvious fault.
-  if (sanitized.seq !== undefined && previous && sanitized.seq <= previous.seq) return;
+  if (sanitized.seq !== undefined && previous && sanitized.seq <= previous.seq) return null;
   const existing = players.get(peerId);
   if (existing) {
     existing.name = sanitized.name;
@@ -96,6 +100,7 @@ export function receiveRemotePlayer(
     receivedAt,
     seq: sanitized.seq ?? (previous ? previous.seq : 0),
   });
+  return sanitized;
 }
 
 export function smoothRemotePlayers(

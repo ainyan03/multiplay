@@ -4,7 +4,7 @@ import { boundedString, finite, integer, record } from "./validate.ts";
 // Bump when a wire format change would confuse an older client. Peers never
 // disconnect over a mismatch; a client that sees a higher version just tells
 // its user to reload, so a deploy can roll out while old tabs keep playing.
-export const PROTO_VERSION = 1;
+export const PROTO_VERSION = 2;
 const MAX_PROTO_VERSION = 1_000_000;
 
 export const STATE_SEND_MS = 66;
