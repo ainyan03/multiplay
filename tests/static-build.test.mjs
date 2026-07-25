@@ -13,5 +13,9 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.ok(scripts.some((source) => source.includes("GEM SPRINT")));
   assert.ok(scripts.some((source) => source.includes("CROWN CHASE")));
   assert.ok(scripts.some((source) => source.includes("PULSE PUSH")));
+  assert.ok(scripts.some((source) => source.includes("LOBBY PLAZA")));
+  assert.ok(scripts.some((source) => source.includes("GLOBAL CHAT")));
+  assert.ok(scripts.some((source) => source.includes("presence-v1")));
+  assert.ok(scripts.some((source) => source.includes("chat-v1")));
   await access(new URL("../dist/og.png", import.meta.url));
 });
