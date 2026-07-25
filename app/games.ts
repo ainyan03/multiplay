@@ -45,6 +45,7 @@ export type GameDefinition = {
   description: string;
   players: string;
   accent: string;
+  portal: { x: number; y: number; color: string };
   action?: "pulse";
   actionLabel: string;
   initialCrown?: boolean;
@@ -108,6 +109,7 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
     description: "フィールドを駆け回って光る宝石を集めよう。60秒でいちばん集めた人の勝ち。",
     players: "2–16人",
     accent: "yellow",
+    portal: { x: 180, y: 145, color: "#f9e547" },
     actionLabel: "A",
     update: ({ me, collected, now, playTone }) => {
       keepInsideField(me);
@@ -130,6 +132,7 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
     description: "王冠を持つ相手にタッチ！ 持っている時間だけ得点が増える、逆転だらけのおにごっこ。",
     players: "2–12人",
     accent: "pink",
+    portal: { x: 780, y: 145, color: "#ff6082" },
     actionLabel: "A",
     initialCrown: true,
     update: ({ me, players, now, dt, playTone }) => {
@@ -157,6 +160,7 @@ export const GAME_DEFINITIONS: GameDefinition[] = [
     description: "パルスでライバルを押し出せ。落ちてもすぐ復帰できる、にぎやかなサバイバル。",
     players: "2–8人",
     accent: "cyan",
+    portal: { x: 480, y: 430, color: "#5fe0c0" },
     action: "pulse",
     actionLabel: "PULSE",
     update: ({ me, pulses, now, dt, selfId, playTone }) => {

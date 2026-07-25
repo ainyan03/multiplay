@@ -25,12 +25,6 @@ type ChatEntry = ChatPayload & { authorId: string; system?: boolean };
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
-const LOBBY_PORTALS: Array<{ gameId: GameId; x: number; y: number; color: string }> = [
-  { gameId: "gem-sprint", x: 180, y: 145, color: "#f9e547" },
-  { gameId: "crown-chase", x: 780, y: 145, color: "#ff6082" },
-  { gameId: "pulse-push", x: 480, y: 430, color: "#5fe0c0" },
-];
-
 const LOBBY = {
   id: "lobby" as const,
   icon: "⌂",
@@ -43,6 +37,7 @@ const LOBBY = {
 };
 
 const PLACES = [LOBBY, ...GAMES];
+const LOBBY_PORTALS = GAMES.map((game) => ({ gameId: game.id, ...game.portal }));
 
 function isPlaceId(value: unknown): value is PlaceId {
   return value === "lobby" || GAMES.some((game) => game.id === value);
@@ -231,7 +226,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
   }, []);
 
   const counts = useMemo(() => {
-    const result: Record<PlaceId, number> = { lobby: 0, "gem-sprint": 0, "crown-chase": 0, "pulse-push": 0 };
+    const result = Object.fromEntries(PLACES.map((item) => [item.id, 0])) as Record<PlaceId, number>;
     for (const item of presence.values()) result[item.place] += 1;
     return result;
   }, [presence]);
