@@ -22,11 +22,16 @@ type Pulse = PulseState;
 type PresencePayload = { name: string; place: PlaceId; at: number };
 type ChatPayload = { id: string; name: string; text: string; at: number; place: PlaceId };
 type ChatEntry = ChatPayload & { authorId: string; system?: boolean };
+type ChatHistoryRequest = { version: 1 };
+type ChatHistoryResponse = { messages: ChatPayload[] };
 type LobbyImpulsePayload = { id: string; targetId: string; vx: number; vy: number; at: number };
 
 const COLORS = ["#f9e547", "#ff6b8a", "#68e6c1", "#73a7ff", "#cf83ff", "#ff9d4d"];
 const APP_ID = "ainyan-multiplay-arcade-v2";
 const CHAT_VISIBLE_MS = 6_000;
+const OWN_CHAT_STORAGE_KEY = "multiplay-own-chat-v1";
+const OWN_CHAT_HISTORY_LIMIT = 40;
+const CHAT_LOG_LIMIT = 100;
 const LOBBY = {
   id: "lobby" as const,
   icon: "⌂",
@@ -47,6 +52,52 @@ function isPlaceId(value: unknown): value is PlaceId {
 
 function shortId(id: string) {
   return id.slice(0, 5).toUpperCase();
+}
+
+function sanitizeChatPayload(value: unknown): ChatPayload | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Partial<ChatPayload>;
+  if (typeof item.id !== "string" || typeof item.name !== "string" || typeof item.text !== "string") return null;
+  if (typeof item.at !== "number" || !Number.isFinite(item.at) || !isPlaceId(item.place)) return null;
+  const text = item.text.trim().slice(0, 180);
+  if (!text) return null;
+  return {
+    id: item.id.slice(0, 120),
+    name: item.name.slice(0, 14),
+    text,
+    at: item.at,
+    place: item.place,
+  };
+}
+
+function loadOwnChatHistory() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(OWN_CHAT_STORAGE_KEY) ?? "[]");
+    if (!Array.isArray(stored)) return [];
+    return stored.map(sanitizeChatPayload).filter((item): item is ChatPayload => item !== null).slice(-OWN_CHAT_HISTORY_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function saveOwnChatHistory(history: ChatPayload[]) {
+  try {
+    window.localStorage.setItem(OWN_CHAT_STORAGE_KEY, JSON.stringify(history.slice(-OWN_CHAT_HISTORY_LIMIT)));
+  } catch {
+    // Storage can be unavailable in private modes; live chat should continue working.
+  }
+}
+
+function mergeChatEntries(current: ChatEntry[], incoming: ChatEntry[]) {
+  const system = current.find((entry) => entry.system);
+  const byMessageId = new Map<string, ChatEntry>();
+  for (const entry of [...current, ...incoming]) {
+    if (!entry.system) byMessageId.set(entry.id, entry);
+  }
+  const messages = [...byMessageId.values()]
+    .sort((first, second) => first.at - second.at)
+    .slice(-(CHAT_LOG_LIMIT - (system ? 1 : 0)));
+  return system ? [system, ...messages] : messages;
 }
 
 
@@ -126,6 +177,8 @@ function useReconnectEpoch() {
 }
 
 function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
+  const [initialOwnHistory] = useState(loadOwnChatHistory);
+  const ownHistoryRef = useRef<ChatPayload[]>(initialOwnHistory);
   const [presence, setPresence] = useState<Map<string, PresencePayload>>(() => new Map());
   const [chats, setChats] = useState<ChatEntry[]>(() => [{
     id: "welcome",
@@ -135,7 +188,7 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     at: Date.now(),
     place: "lobby",
     system: true,
-  }]);
+  }, ...initialOwnHistory.map((message) => ({ ...message, authorId: selfId }))]);
   const sendPresenceRef = useRef<((payload: PresencePayload) => Promise<void>) | null>(null);
   const sendChatRef = useRef<((payload: ChatPayload) => Promise<void>) | null>(null);
   const identityRef = useRef({ name, place });
@@ -165,6 +218,12 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "community-hub");
     const presenceAction = room.makeAction<PresencePayload>("presence-v1");
     const chatAction = room.makeAction<ChatPayload>("chat-v1");
+    const historyAction = room.makeAction<ChatHistoryRequest, ChatHistoryResponse>("chat-history-v1", {
+      kind: "request",
+      onRequest: (request) => ({
+        messages: request?.version === 1 ? ownHistoryRef.current.slice(-OWN_CHAT_HISTORY_LIMIT) : [],
+      }),
+    });
     sendPresenceRef.current = (payload) => presenceAction.send(payload);
     sendChatRef.current = (payload) => chatAction.send(payload);
 
@@ -178,17 +237,27 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
     };
     chatAction.onMessage = (payload, { peerId }) => {
       if (!payload || typeof payload.text !== "string" || !isPlaceId(payload.place)) return;
+      const sanitized = sanitizeChatPayload(payload);
+      if (!sanitized) return;
       const entry: ChatEntry = {
-        ...payload,
+        ...sanitized,
         authorId: peerId,
-        name: payload.name.slice(0, 14),
-        text: payload.text.trim().slice(0, 180),
         at: Date.now(),
       };
-      if (!entry.text) return;
-      setChats((current) => current.some((item) => item.id === entry.id) ? current : [...current, entry].slice(-80));
+      setChats((current) => mergeChatEntries(current, [entry]));
     };
-    room.onPeerJoin = () => publishPresence();
+    room.onPeerJoin = (peerId) => {
+      publishPresence();
+      void historyAction.request({ version: 1 }, { target: peerId, timeoutMs: 3_000 }).then((response) => {
+        if (!response || !Array.isArray(response.messages)) return;
+        const restored = response.messages
+          .slice(-OWN_CHAT_HISTORY_LIMIT)
+          .map(sanitizeChatPayload)
+          .filter((item): item is ChatPayload => item !== null)
+          .map((message): ChatEntry => ({ ...message, authorId: peerId }));
+        if (restored.length) setChats((current) => mergeChatEntries(current, restored));
+      }).catch(() => undefined);
+    };
     room.onPeerLeave = (peerId) => {
       setPresence((current) => {
         const next = new Map(current);
@@ -223,7 +292,9 @@ function useCommunity(name: string, place: PlaceId, connectionEpoch: number) {
       at: Date.now(),
       place: identityRef.current.place,
     };
-    setChats((current) => [...current, { ...payload, authorId: selfId }].slice(-80));
+    ownHistoryRef.current = [...ownHistoryRef.current, payload].slice(-OWN_CHAT_HISTORY_LIMIT);
+    saveOwnChatHistory(ownHistoryRef.current);
+    setChats((current) => mergeChatEntries(current, [{ ...payload, authorId: selfId }]));
     void sendChatRef.current?.(payload);
   }, []);
 

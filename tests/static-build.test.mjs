@@ -4,6 +4,7 @@ import test from "node:test";
 
 test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   const html = await readFile(new URL("../dist/index.html", import.meta.url), "utf8");
+  const arcadeSource = await readFile(new URL("../app/arcade.tsx", import.meta.url), "utf8");
   const gameDefinitions = await readFile(new URL("../app/games.ts", import.meta.url), "utf8");
   const lobbyPhysics = await readFile(new URL("../app/lobbyPhysics.ts", import.meta.url), "utf8");
   const assets = await readdir(new URL("../dist/assets/", import.meta.url));
@@ -19,6 +20,10 @@ test("builds a GitHub Pages-ready multiplayer arcade", async () => {
   assert.ok(scripts.some((source) => source.includes("GLOBAL CHAT")));
   assert.ok(scripts.some((source) => source.includes("presence-v1")));
   assert.ok(scripts.some((source) => source.includes("chat-v1")));
+  assert.ok(scripts.some((source) => source.includes("chat-history-v1")));
+  assert.ok(scripts.some((source) => source.includes("multiplay-own-chat-v1")));
+  assert.match(arcadeSource, /OWN_CHAT_HISTORY_LIMIT = 40/);
+  assert.match(arcadeSource, /CHAT_LOG_LIMIT = 100/);
   assert.ok(scripts.some((source) => source.includes("enterKeyHint")));
   assert.ok(scripts.some((source) => source.includes("mobile-controller")));
   assert.ok(scripts.some((source) => source.includes("analog-stick")));
