@@ -50,6 +50,12 @@ import {
   type PresencePayload,
 } from "./protocol.ts";
 import { receiveRemotePlayer, smoothRemotePlayers, toWirePlayer, type RemoteMotion, type WirePlayer } from "./remotePlayers.ts";
+import {
+  activePresenceEffects,
+  makePresenceEffect,
+  PRESENCE_EFFECT_MS,
+  type PresenceEffect,
+} from "./presenceEffects.ts";
 
 type Player = PlayerState;
 
@@ -110,6 +116,25 @@ function getAudioContext() {
   }
   if (sharedAudioContext.state === "suspended") void sharedAudioContext.resume();
   return sharedAudioContext;
+}
+
+function playPresenceSound(enabled: boolean, kind: PresenceEffect["kind"]) {
+  if (!enabled) return;
+  const context = getAudioContext();
+  if (!context) return;
+  const notes = kind === "join" ? [440, 660, 880] : [620, 420, 240];
+  notes.forEach((frequency, index) => {
+    const startsAt = context.currentTime + index * .055;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = kind === "join" ? "square" : "triangle";
+    oscillator.frequency.value = frequency;
+    gain.gain.setValueAtTime(.035, startsAt);
+    gain.gain.exponentialRampToValueAtTime(.001, startsAt + .11);
+    oscillator.connect(gain).connect(context.destination);
+    oscillator.start(startsAt);
+    oscillator.stop(startsAt + .12);
+  });
 }
 
 function useReconnectEpoch() {
@@ -317,7 +342,16 @@ export function Arcade() {
           onLeave={() => setGameId(null)}
         />
       ) : (
-        <LobbyScreen name={name} chats={community.chats} counts={community.counts} connectionEpoch={connectionEpoch} onName={setName} onJoin={setGameId} />
+        <LobbyScreen
+          name={name}
+          sound={sound}
+          chats={community.chats}
+          counts={community.counts}
+          connectionEpoch={connectionEpoch}
+          onName={setName}
+          onSound={() => setSound((value) => !value)}
+          onJoin={setGameId}
+        />
       )}
       <ChatPanel chats={community.chats} names={community.names} place={place} onSend={community.sendChat} />
       {community.outdated && (
@@ -329,12 +363,14 @@ export function Arcade() {
   );
 }
 
-function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
+function LobbyScreen({ name, sound, chats, counts, connectionEpoch, onName, onSound, onJoin }: {
   name: string;
+  sound: boolean;
   chats: ChatEntry[];
   counts: Record<PlaceId, number>;
   connectionEpoch: number;
   onName: (name: string) => void;
+  onSound: () => void;
   onJoin: (id: GameId) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -346,9 +382,11 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
   const sendImpulseRef = useRef<((impulse: LobbyImpulsePayload) => Promise<void>) | null>(null);
   const collisionTimesRef = useRef(new Map<string, number>());
   const receivedImpulseIdsRef = useRef(new Set<string>());
+  const presenceEffectsRef = useRef<PresenceEffect[]>([]);
   const chatsRef = useRef(chats);
   const countsRef = useRef(counts);
   const nameRef = useRef(name);
+  const soundRef = useRef(sound);
   const nearGameRef = useRef<GameId | null>(null);
   const [nearGame, setNearGame] = useState<GameId | null>(null);
   const [connected, setConnected] = useState(1);
@@ -356,6 +394,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
 
   useEffect(() => { chatsRef.current = chats; }, [chats]);
   useEffect(() => { countsRef.current = counts; }, [counts]);
+  useEffect(() => { soundRef.current = sound; }, [sound]);
   useEffect(() => {
     nameRef.current = name;
     const me = playersRef.current.get(selfId);
@@ -380,10 +419,13 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     remoteMotionsRef.current.clear();
     collisionTimesRef.current.clear();
     receivedImpulseIdsRef.current.clear();
-    playersRef.current.set(selfId, existing ?? {
+    const localPlayer = existing ?? {
       id: selfId, name: nameRef.current || "PLAYER", x: WIDTH / 2, y: HEIGHT / 2,
       vx: 0, vy: 0, color, score: 0, seen: Date.now(),
-    });
+    };
+    playersRef.current.set(selfId, localPlayer);
+    presenceEffectsRef.current = [makePresenceEffect(localPlayer, "join", Date.now())];
+    playPresenceSound(soundRef.current, "join");
     setConnected(1);
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, "public-lobby");
     const stateAction = room.makeAction<WirePlayer>("player-state");
@@ -391,7 +433,14 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
     sendStateRef.current = (state) => stateAction.send(state);
     sendImpulseRef.current = (impulse) => impulseAction.send(impulse);
     stateAction.onMessage = (state, { peerId }) => {
-      receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, Date.now());
+      const wasPresent = playersRef.current.has(peerId);
+      const receivedAt = Date.now();
+      const accepted = receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, receivedAt);
+      const player = playersRef.current.get(peerId);
+      if (!wasPresent && accepted && player) {
+        presenceEffectsRef.current.push(makePresenceEffect(player, "join", receivedAt));
+        playPresenceSound(soundRef.current, "join");
+      }
     };
     impulseAction.onMessage = (payload, { peerId }) => {
       const impulse = parseLobbyImpulse(payload, selfId);
@@ -412,6 +461,11 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       broadcastState();
     };
     room.onPeerLeave = (peerId) => {
+      const player = playersRef.current.get(peerId);
+      if (player) {
+        presenceEffectsRef.current.push(makePresenceEffect(player, "leave", Date.now()));
+        playPresenceSound(soundRef.current, "leave");
+      }
       playersRef.current.delete(peerId);
       remoteMotionsRef.current.delete(peerId);
       setConnected(Object.keys(room.getPeers()).length + 1);
@@ -478,9 +532,12 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
       const closest = LOBBY_PORTALS.find((portal) => Math.hypot(me.x - portal.x, me.y - portal.y) < 76)?.gameId ?? null;
       if (closest !== nearGameRef.current) { nearGameRef.current = closest; setNearGame(closest); }
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
+        presenceEffectsRef.current.push(makePresenceEffect(player, "leave", now));
+        playPresenceSound(soundRef.current, "leave");
         playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
       }
-      drawLobby(context, [...playersRef.current.values()], chatsRef.current, countsRef.current, closest, now);
+      presenceEffectsRef.current = activePresenceEffects(presenceEffectsRef.current, now);
+      drawLobby(context, [...playersRef.current.values()], chatsRef.current, countsRef.current, closest, presenceEffectsRef.current, now);
       frame = requestAnimationFrame(loop);
     };
     frame = requestAnimationFrame(loop);
@@ -496,7 +553,7 @@ function LobbyScreen({ name, chats, counts, connectionEpoch, onName, onJoin }: {
           <div><strong>MULTIPLAY</strong><small>LOBBY MAP</small></div>
         </div>
         <label className="lobby-name" htmlFor="player-name"><span>PLAYER</span><input id="player-name" maxLength={PLAYER_NAME_LIMIT} value={name} onChange={(event) => onName(event.target.value.toUpperCase())} /></label>
-        <div className="play-status"><span className="online-dot" /> {connected} IN PLAZA</div>
+        <div className="play-status"><span className="online-dot" /> {connected} IN PLAZA <button onClick={onSound} aria-label="サウンド切替">{sound ? "SOUND ON" : "SOUND OFF"}</button></div>
       </header>
       <nav className="occupancy-strip" aria-label="各ゲームの参加人数">
         {PLACES.map((item) => <span className={item.id === "lobby" ? "active" : ""} key={item.id}><b>{item.shortTitle}</b> {counts[item.id]}</span>)}
@@ -869,6 +926,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
   const playersRef = useRef<Map<string, Player>>(new Map());
   const remoteMotionsRef = useRef<Map<string, RemoteMotion>>(new Map());
   const arenaRef = useRef(createArenaRuntime());
+  const presenceEffectsRef = useRef<PresenceEffect[]>([]);
   const keysRef = useRef(new Set<string>());
   const stickRef = useRef({ x: 0, y: 0 });
   const sendStateRef = useRef<((state: WirePlayer) => Promise<void>) | null>(null);
@@ -949,6 +1007,9 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       existing.vx = 0;
       existing.vy = 0;
     }
+    const localPlayer = playersRef.current.get(selfId)!;
+    presenceEffectsRef.current = [makePresenceEffect(localPlayer, "join", now)];
+    playPresenceSound(soundRef.current, "join");
     setConnected(1);
 
     const room = joinRoom({ appId: APP_ID, relayConfig: { redundancy: 3 } }, `public-${game.id}`);
@@ -960,8 +1021,14 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
     sendNpcsRef.current = (snapshot) => npcAction.send(snapshot);
     stateAction.onMessage = (state, { peerId }) => {
       const receivedAt = Date.now();
+      const wasPresent = playersRef.current.has(peerId);
       const accepted = receiveRemotePlayer(playersRef.current, remoteMotionsRef.current, state, peerId, receivedAt);
       if (accepted?.ts !== undefined) observeSkew(skewRef.current, peerId, accepted.ts, receivedAt);
+      const player = playersRef.current.get(peerId);
+      if (!wasPresent && accepted && player) {
+        presenceEffectsRef.current.push(makePresenceEffect(player, "join", receivedAt));
+        playPresenceSound(soundRef.current, "join");
+      }
     };
     bombAction.onMessage = (payload, { peerId }) => {
       const roomNow = correctedRoomNow(Date.now(), peerSkews(skewRef.current));
@@ -978,6 +1045,11 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
       broadcastState();
     };
     room.onPeerLeave = (peerId) => {
+      const player = playersRef.current.get(peerId);
+      if (player) {
+        presenceEffectsRef.current.push(makePresenceEffect(player, "leave", Date.now()));
+        playPresenceSound(soundRef.current, "leave");
+      }
       playersRef.current.delete(peerId);
       remoteMotionsRef.current.delete(peerId);
       // Enemies exist only while the client running them is here.
@@ -1076,13 +1148,17 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
 
       smoothRemotePlayers(playersRef.current, remoteMotionsRef.current, selfId, dt, now);
       for (const [id, player] of playersRef.current) if (id !== selfId && now - player.seen > 10_000) {
+        presenceEffectsRef.current.push(makePresenceEffect(player, "leave", now));
+        playPresenceSound(soundRef.current, "leave");
         playersRef.current.delete(id); remoteMotionsRef.current.delete(id);
       }
+      presenceEffectsRef.current = activePresenceEffects(presenceEffectsRef.current, now);
       if (time - lastBoard > 300) { lastBoard = time; setScoreboard([...playersRef.current.values()].sort((a, b) => b.score - a.score)); }
 
       if (game.kind === "arena" && arenaSnapshot) {
         const roomNow = correctedRoomNow(now, peerSkews(skewRef.current));
         drawArena(context, arenaSnapshot, arenaRef.current, roomNow);
+        drawPresenceEffects(context, presenceEffectsRef.current, now);
         const recent = recentChatMap(chatsRef.current, now);
         for (const player of playersRef.current.values()) {
           // A player waiting to respawn is hidden rather than left standing.
@@ -1091,7 +1167,7 @@ function GameScreen({ game, name, sound, chats, counts, connectionEpoch, onSound
         }
         if (roomNow < arenaRef.current.deadUntil) drawDeathOverlay(context, arenaRef.current.deadUntil - roomNow);
       } else {
-        drawGame(context, game, [...playersRef.current.values()], collectedRef.current, chatsRef.current, now);
+        drawGame(context, game, [...playersRef.current.values()], collectedRef.current, chatsRef.current, presenceEffectsRef.current, now);
       }
       frame = requestAnimationFrame(loop);
     };
@@ -1132,6 +1208,7 @@ function drawGame(
   players: Player[],
   collected: Set<string>,
   chats: ChatEntry[],
+  presenceEffects: PresenceEffect[],
   now: number,
 ) {
   context.clearRect(0, 0, WIDTH, HEIGHT);
@@ -1142,6 +1219,7 @@ function drawGame(
   context.strokeStyle = "#233247"; context.lineWidth = 5; context.strokeRect(14, 14, WIDTH - 28, HEIGHT - 28);
   game.draw?.({ context, collected, now });
 
+  drawPresenceEffects(context, presenceEffects, now);
   const recentChats = recentChatMap(chats, now);
   for (const player of players) drawAvatar(context, player, recentChats.get(player.id));
 }
@@ -1152,6 +1230,7 @@ function drawLobby(
   chats: ChatEntry[],
   counts: Record<PlaceId, number>,
   nearGame: GameId | null,
+  presenceEffects: PresenceEffect[],
   now: number,
 ) {
   context.clearRect(0, 0, WIDTH, HEIGHT);
@@ -1180,8 +1259,41 @@ function drawLobby(
     context.font = "800 10px monospace"; context.fillText(`${counts[game.id]} PLAYING`, 0, 35);
     context.restore();
   }
+  drawPresenceEffects(context, presenceEffects, now);
   const recentChats = recentChatMap(chats, now);
   for (const player of players) drawAvatar(context, player, recentChats.get(player.id));
+}
+
+function drawPresenceEffects(context: CanvasRenderingContext2D, effects: PresenceEffect[], now: number) {
+  for (const effect of effects) {
+    const progress = Math.max(0, Math.min(1, (now - effect.at) / PRESENCE_EFFECT_MS));
+    const alpha = 1 - progress;
+    const direction = effect.kind === "join" ? 1 - progress : progress;
+    const radius = 18 + direction * 38;
+    context.save();
+    context.translate(effect.x, effect.y);
+    context.globalAlpha = alpha;
+    context.strokeStyle = effect.color;
+    context.lineWidth = 3;
+    context.shadowBlur = 14;
+    context.shadowColor = effect.color;
+    context.beginPath();
+    context.arc(0, 0, radius, 0, Math.PI * 2);
+    context.stroke();
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.arc(0, 0, Math.max(6, radius - 10), 0, Math.PI * 2);
+    context.stroke();
+    context.shadowBlur = 0;
+    context.fillStyle = effect.color;
+    for (let index = 0; index < 8; index += 1) {
+      const angle = index * Math.PI / 4;
+      const distance = effect.kind === "join" ? 52 * (1 - progress) : 18 + 42 * progress;
+      const size = Math.max(1.5, 5 * alpha);
+      context.fillRect(Math.cos(angle) * distance - size / 2, Math.sin(angle) * distance - size / 2, size, size);
+    }
+    context.restore();
+  }
 }
 
 function recentChatMap(chats: ChatEntry[], now: number) {
